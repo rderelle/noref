@@ -1,0 +1,367 @@
+//! Column selection in each variant group and alignment construction.
+use anyhow::Result;
+use rayon::{prelude::*, ThreadPoolBuilder};
+
+use crate::dna::encode;
+use crate::group_extraction::BlockArena;
+use crate::group_sorting::{rows_by_isolate, SortedGroup, SortedGroups};
+
+/// Fully assembled result returned to the CLI layer before writing files.
+pub(crate) struct AlignmentResult {
+    /// Isolate names in the same row order as `concat`.
+    pub(crate) isolate_names: Vec<String>,
+    /// Concatenated alignment rows, one byte vector per isolate.
+    pub(crate) concat: Vec<Vec<u8>>,
+    /// Number of variant groups in the alignment.
+    pub(crate) n_groups: usize,
+    /// Alignment column just after the last column of each variant group.
+    pub(crate) group_ends: Vec<u32>,
+    /// Genome position of each variant group in each isolate (`group * n + isolate`),
+    /// or [`NO_POSITION`] when the isolate lacks the group.
+    pub(crate) positions: Vec<u32>,
+    /// Per isolate: end of each contig in the genome (contigs placed end to end).
+    pub(crate) contig_ends: Vec<Vec<u32>>,
+}
+
+/// Marks isolates without a position for a variant group.
+pub(crate) const NO_POSITION: u32 = u32::MAX;
+
+struct FilteredGroup {
+    /// Flattened per-isolate rows after retained-column projection.
+    rows: Vec<u8>,
+    /// Number of retained columns in each flattened row.
+    kept_len: usize,
+    /// Genome position of the group in each isolate (`NO_POSITION` when missing).
+    positions: Vec<u32>,
+}
+
+#[inline]
+fn is_missing(b: u8) -> bool {
+    b == b'-' || b == b'N'
+}
+
+/// Per-column majority base (ties keep the first of A, C, G, T); `None` if empty.
+fn majority_consensus(rows: &[Vec<u8>], len: usize) -> Vec<Option<u8>> {
+    (0..len)
+        .map(|c| {
+            // Slot 4 collects `N`, gaps and any other non-ACGT byte.
+            let mut counts = [0usize; 5];
+            for row in rows {
+                counts[encode(row[c]) as usize] += 1;
+            }
+            let (best, &count) = counts[..4]
+                .iter()
+                .enumerate()
+                .rev()
+                .max_by_key(|&(_, count)| count)?;
+            (count > 0).then_some(b"ACGT"[best])
+        })
+        .collect()
+}
+
+/// Mask (with `N`) rows having at least `mask` consecutive differences to the
+/// consensus; missing positions break runs.
+fn mask_rows_with_long_divergence(rows: &mut [Vec<u8>], consensus: &[Option<u8>], mask: usize) {
+    if mask == 0 {
+        return;
+    }
+    for row in rows {
+        let mut run = 0usize;
+        let divergent = row.iter().zip(consensus).any(|(&b, &cons)| {
+            match cons {
+                Some(cons) if !is_missing(b) && b != cons => run += 1,
+                _ => run = 0,
+            }
+            run >= mask
+        });
+        if divergent {
+            row.fill(b'N');
+        }
+    }
+}
+
+fn is_polymorphic_column(rows: &[Vec<u8>], col: usize) -> bool {
+    let mut observed = rows.iter().map(|r| r[col]).filter(|&b| !is_missing(b));
+    observed
+        .next()
+        .is_some_and(|first| observed.any(|b| b != first))
+}
+
+fn has_minimum_presence(rows: &[Vec<u8>], col: usize, min_needed: usize) -> bool {
+    rows.iter().filter(|r| !is_missing(r[col])).count() >= min_needed
+}
+
+/// Whether a column holds three or four bases, the two most frequent of which are
+/// equally frequent. Other columns with three or four bases are split into one SNP per
+/// base other than the most frequent one (see [`crate::snp_clusters`]); for these, the
+/// most frequent base is not defined, so they are left out of the alignment.
+fn has_tied_majority(rows: &[Vec<u8>], col: usize) -> bool {
+    let mut counts = [0usize; 5];
+    for row in rows {
+        counts[encode(row[col]) as usize] += 1;
+    }
+    let mut bases = counts[..4].to_vec();
+    bases.sort_unstable_by(|a, b| b.cmp(a));
+    bases[2] > 0 && bases[0] == bases[1]
+}
+
+/// Columns of `rows` to keep: those present in at least `min_needed` rows and without
+/// a tied majority (see [`has_tied_majority`]), trimmed to the first and last
+/// polymorphic ones. Divergent rows are masked first (`mask > 0`). Returns `None` when
+/// no retained column is polymorphic.
+fn select_columns(
+    rows: &mut [Vec<u8>],
+    len: usize,
+    min_needed: usize,
+    mask: usize,
+) -> Option<Vec<usize>> {
+    if mask > 0 {
+        let consensus = majority_consensus(rows, len);
+        mask_rows_with_long_divergence(rows, &consensus, mask);
+    }
+    let retained: Vec<usize> = (0..len)
+        .filter(|&c| has_minimum_presence(rows, c, min_needed) && !has_tied_majority(rows, c))
+        .collect();
+    let first = retained
+        .iter()
+        .position(|&c| is_polymorphic_column(rows, c))?;
+    let last = retained
+        .iter()
+        .rposition(|&c| is_polymorphic_column(rows, c))?;
+    Some(retained[first..=last].to_vec())
+}
+
+fn filter_group(
+    raw: SortedGroup,
+    arena: &BlockArena,
+    n: usize,
+    min_needed: usize,
+    mask: usize,
+) -> Option<FilteredGroup> {
+    let len = raw.middle_len;
+    let mut rows = rows_by_isolate(&raw.group, arena, n, len);
+    let keep_cols = select_columns(&mut rows, len, min_needed, mask)?;
+    let kept_len = keep_cols.len();
+    let mut kept_rows = Vec::with_capacity(n * kept_len);
+    for row in &rows {
+        kept_rows.extend(keep_cols.iter().map(|&c| row[c]));
+    }
+    let mut positions = vec![NO_POSITION; n];
+    for o in &raw.group.occurrences {
+        positions[o.isolate as usize] = o.pos;
+    }
+    Some(FilteredGroup {
+        rows: kept_rows,
+        kept_len,
+        positions,
+    })
+}
+
+/// Build the alignment from the variant groups, keeping the columns with a base in at
+/// least `min_needed` isolates.
+pub(crate) fn filter_groups(
+    sorted: SortedGroups,
+    min_needed: usize,
+    mask: usize,
+    num_threads: usize,
+) -> Result<AlignmentResult> {
+    let SortedGroups {
+        isolate_names,
+        arena,
+        groups,
+        contig_ends,
+        n_isolates: n,
+    } = sorted;
+
+    // Per-group filtering is independent; `collect` on an indexed parallel iterator
+    // keeps the deterministic order of the sorted groups.
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(num_threads.max(1))
+        .build()?;
+    let filtered: Vec<FilteredGroup> = pool.install(|| {
+        groups
+            .into_par_iter()
+            .map(|raw| filter_group(raw, &arena, n, min_needed, mask))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flatten()
+            .collect()
+    });
+    drop(arena);
+
+    let n_groups = filtered.len();
+    let final_len: usize = filtered.iter().map(|group| group.kept_len).sum();
+    let mut concat = vec![Vec::with_capacity(final_len); n];
+    let mut group_ends = Vec::with_capacity(n_groups);
+    let mut positions = Vec::with_capacity(n_groups * n);
+    for group in filtered {
+        for (row_out, row) in concat
+            .iter_mut()
+            .zip(group.rows.chunks_exact(group.kept_len))
+        {
+            row_out.extend_from_slice(row);
+        }
+        group_ends.push(concat[0].len() as u32);
+        positions.extend_from_slice(&group.positions);
+    }
+    Ok(AlignmentResult {
+        isolate_names,
+        concat,
+        n_groups,
+        group_ends,
+        positions,
+        contig_ends,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::group_extraction::{BlockOccurrence, RawGroup};
+
+    fn rows(rows: &[&[u8]]) -> Vec<Vec<u8>> {
+        rows.iter().map(|r| r.to_vec()).collect()
+    }
+
+    /// Kept columns of `rows`, as the projected rows.
+    fn project(input: &[&[u8]], min_needed: usize, mask: usize) -> Option<Vec<Vec<u8>>> {
+        let mut r = rows(input);
+        let cols = select_columns(&mut r, input[0].len(), min_needed, mask)?;
+        Some(
+            r.iter()
+                .map(|row| cols.iter().map(|&c| row[c]).collect())
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn exact_minimum_presence_is_retained_without_float_rounding() {
+        let mut rows = vec![vec![b'A']; 17];
+        rows.extend(vec![vec![b'-']; 3]);
+        assert!(has_minimum_presence(&rows, 0, 17));
+        assert!(!has_minimum_presence(&rows, 0, 18));
+        rows[0][0] = b'N';
+        assert!(!has_minimum_presence(&rows, 0, 17));
+    }
+
+    #[test]
+    fn consensus_ignores_missing_and_breaks_ties_in_acgt_order() {
+        let r = rows(&[b"AAN", b"CC-", b"C-G", b"-A-"]);
+        assert_eq!(
+            majority_consensus(&r, 3),
+            vec![Some(b'C'), Some(b'A'), Some(b'G')]
+        );
+        assert_eq!(majority_consensus(&rows(&[b"N"]), 1), vec![None]);
+    }
+
+    #[test]
+    fn masking_requires_consecutive_differences() {
+        let consensus = vec![Some(b'A'); 5];
+        let mut r = rows(&[b"ACCAA", b"ACCCA", b"CC-CC", b"CCNCC"]);
+        mask_rows_with_long_divergence(&mut r, &consensus, 3);
+        assert_eq!(r, rows(&[b"ACCAA", b"NNNNN", b"CC-CC", b"CCNCC"]));
+        let mut r = rows(&[b"CCCCC"]);
+        let gapped = [Some(b'A'), Some(b'A'), None, Some(b'A'), Some(b'A')];
+        mask_rows_with_long_divergence(&mut r, &gapped, 3);
+        assert_eq!(r[0], b"CCCCC");
+        mask_rows_with_long_divergence(&mut r, &consensus, 0);
+        assert_eq!(r[0], b"CCCCC");
+    }
+
+    #[test]
+    fn polymorphism_ignores_gaps_and_n() {
+        let r = rows(&[b"AA", b"NC", b"-A"]);
+        assert!(!is_polymorphic_column(&r, 0));
+        assert!(is_polymorphic_column(&r, 1));
+    }
+
+    #[test]
+    fn columns_are_trimmed_to_first_and_last_polymorphic_columns() {
+        assert_eq!(
+            project(&[b"AGCTA", b"ACCAA"], 2, 0),
+            Some(rows(&[b"GCT", b"CCA"]))
+        );
+    }
+
+    #[test]
+    fn conserved_groups_are_discarded() {
+        assert_eq!(project(&[b"ACCG", b"ACCG", b"ACNG", b"A-CG"], 2, 0), None);
+    }
+
+    #[test]
+    fn missingness_filtering_happens_before_polymorphic_trimming() {
+        let kept = project(&[b"ATCAG", b"AGCTG", b"A-CAG", b"A-CTG"], 3, 0);
+        assert_eq!(kept, Some(rows(&[b"A", b"T", b"A", b"T"])));
+    }
+
+    #[test]
+    fn n_does_not_create_polymorphism_and_counts_as_missing() {
+        let kept = project(&[b"ACCAG", b"ACCTG", b"ANCAG", b"ACNTG"], 3, 0);
+        assert_eq!(kept, Some(rows(&[b"A", b"T", b"A", b"T"])));
+    }
+
+    #[test]
+    fn multiallelic_columns_with_a_tied_majority_are_left_out() {
+        let r = rows(&[b"AAAAA", b"AACCA", b"CCGGC", b"CGTTN", b"G-A-T"]);
+        // Column 0 (A A C C G): A and C tied, three bases: tied.
+        // Column 1 (A A C G -): A most frequent: not tied.
+        // Column 2 (A C G T A): A most frequent, minor bases tied: not tied.
+        // Column 3 (A C G T -): four bases, once each: tied.
+        // Column 4 (A A C N T): A most frequent: not tied.
+        let tied: Vec<bool> = (0..5).map(|c| has_tied_majority(&r, c)).collect();
+        assert_eq!(tied, vec![true, false, false, true, false]);
+        // Two bases, even tied, are a biallelic SNP.
+        assert!(!has_tied_majority(&rows(&[b"A", b"A", b"C", b"C"]), 0));
+        let mut kept = r.clone();
+        assert_eq!(select_columns(&mut kept, 5, 4, 0), Some(vec![1, 2, 4]));
+        // A group whose only polymorphic column is tied is discarded.
+        let mut only = rows(&[b"AA", b"AC", b"AT"]);
+        assert_eq!(select_columns(&mut only, 2, 3, 0), None);
+    }
+
+    #[test]
+    fn divergent_rows_are_masked_before_polymorphism_detection() {
+        let input: &[&[u8]] = &[b"ACGTACA", b"ACGTACA", b"AGTACGA"];
+        assert_eq!(project(input, 3, 5), None);
+        assert_eq!(project(input, 3, 0).unwrap()[0].len(), 5);
+    }
+
+    fn sorted(seqs: &[&[u8]]) -> SortedGroups {
+        let mut arena = BlockArena::new();
+        let mut group = RawGroup::default();
+        for (isolate, &seq) in seqs.iter().enumerate() {
+            group.sequences.push(arena.push(seq).unwrap());
+            group.occurrences.push(BlockOccurrence {
+                isolate: isolate as u16 + 1,
+                sequence_id: isolate as u16,
+                pos: 100 + isolate as u32,
+            });
+        }
+        SortedGroups {
+            arena,
+            isolate_names: (0..=seqs.len())
+                .map(|isolate| format!("s{isolate}"))
+                .collect(),
+            groups: vec![SortedGroup {
+                key: (1, 2),
+                coverage: seqs.len(),
+                middle_len: seqs[0].len(),
+                group,
+            }],
+            contig_ends: Vec::new(),
+            n_isolates: seqs.len() + 1,
+        }
+    }
+
+    #[test]
+    fn filter_builds_alignment() {
+        // Isolate 0 is absent (`-` row).
+        let r = filter_groups(sorted(&[b"AGCTA", b"ACCAA"]), 2, 0, 1).unwrap();
+        assert_eq!(r.n_groups, 1);
+        assert_eq!(r.concat, rows(&[b"---", b"GCT", b"CCA"]));
+        // Too much missing data when all three isolates are needed.
+        let r = filter_groups(sorted(&[b"AGCTA", b"ACCAA"]), 3, 0, 1).unwrap();
+        assert_eq!(r.n_groups, 0);
+        assert!(r.concat.iter().all(Vec::is_empty));
+    }
+}

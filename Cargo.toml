@@ -1,0 +1,36 @@
+[package]
+name = "noref"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Fast reference-free, recombination-filtered SNP alignments for within-species phylogenies"
+license = "MIT"
+repository = "https://github.com/rderelle/noref"
+readme = "README.md"
+keywords = ["bioinformatics", "phylogenomic", "alignment-free", "k-mer"]
+categories = ["science"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+seq_io = "0.3.4"
+flate2 = { version = "1.0", features = ["rust_backend"] }
+hashbrown = "0.17"
+rayon = "1.11"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+panic = "abort"
+debug = false
+
+[package.metadata.docs.rs]
+all-features = true
+
+[[bin]]
+name = "noref"
+path = "src/main.rs"
