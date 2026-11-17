@@ -203,6 +203,20 @@ pub struct AtomicCountMinSketch {
     mask: u64,
 }
 
+/// Add 1 to `counter` unless it already holds `u16::MAX` (lock-free).
+///
+/// Written out rather than with `fetch_update`, which recent Rust deprecates in
+/// favour of `try_update`, too recent for the minimum Rust version (1.88).
+fn saturating_increment(counter: &AtomicU16) {
+    let mut current = counter.load(Ordering::Relaxed);
+    while let Some(next) = current.checked_add(1) {
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
 impl AtomicCountMinSketch {
     pub fn new(lines: usize) -> Self {
         let n = lines.max(1).next_power_of_two();
@@ -221,8 +235,7 @@ impl AtomicCountMinSketch {
             let (line, slots) = probes(key, self.mask);
             let line = &self.lines[line].0;
             for s in slots {
-                let _ = line[s]
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| c.checked_add(1));
+                saturating_increment(&line[s]);
             }
         }
     }
