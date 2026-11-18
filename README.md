@@ -39,7 +39,7 @@ This dataset corresponds to the PMEN2 group analysed by [Croucher et al 2014](ht
 ![noref result for the pneumo dataset](images/pneumo.png)
 
 #### 1932 N. gonnorahea genomes (64s/4.3GB)
-This dataset corresponds to the Euro-GASP 2020 study published by [Golparian et al 2024](https://www.thelancet.com/journals/lanmic/article/PIIS2666-5247(23)00370-1/fulltext). Although I haven't checked the locations of recombination hotspots, the overall recombination pattern is consistent with published Gubbins analyses (see examples [here](https://jameshadfield.github.io/phandango/#/examples) and [here](https://pmc.ncbi.nlm.nih.gov/articles/PMC6998845/))
+This dataset corresponds to the Euro-GASP 2020 study published by [Golparian et al 2024](https://www.thelancet.com/journals/lanmic/article/PIIS2666-5247(23)00370-1/fulltext). Although I haven't checked the locations of recombination hotspots, the overall recombination pattern is consistent with published Gubbins analyses of N. gonnorahea genomes (see examples [here](https://jameshadfield.github.io/phandango/#/examples) and [here](https://pmc.ncbi.nlm.nih.gov/articles/PMC6998845/))
 
 ![noref result for the pneumo dataset](images/neisseria.png)
 
