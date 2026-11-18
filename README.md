@@ -44,7 +44,7 @@ This dataset corresponds to the Euro-GASP 2020 study published by [Golparian et 
 ![noref result for the pneumo dataset](images/neisseria.png)
 
 ## input
-[TBC] bacterial genome assemblies in a directory with `-i`, or paths of input files provided in a headerless tab-delimited file using the `-I` argument [kamino](https://github.com/rderelle/kamino#input).
+[TBC] bacterial genome assemblies in a directory with `-i`, or paths of input files provided in a headerless tab-delimited file using the `-I` argument (see [here](https://github.com/rderelle/kamino#input) for more details).
 
 ## output
 [TBC] SNP alignments (with some constant positions; not a pseudo-alignment of genomes), NJ trees with `--nj`, and a recombination gff file for [Phandango](https://github.com/jameshadfield/phandango) with `-p`/`--plot`.
