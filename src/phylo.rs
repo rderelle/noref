@@ -1,5 +1,8 @@
 //! Minimal neighbor-joining implementation used for the optional `--nj` tree.
 //!
+//! The unrooted NJ tree is written rooted at its midpoint: halfway along the longest
+//! path between two leaves.
+//!
 //! Distances are JC69-corrected pairwise nucleotide differences, ignoring gaps
 //! and `N`. The alignment is bit-sliced so each pair comparison handles
 //! 64 columns at a time, and invariant gap-free/all-gap columns are folded away.
@@ -7,22 +10,6 @@
 use rayon::prelude::*;
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use std::fmt::Write as _;
-
-#[derive(Debug, Clone)]
-pub struct Edge {
-    /// Child node index in the shared node arena.
-    pub child: usize,
-    /// Branch length from parent to child.
-    pub len: f64,
-}
-
-#[derive(Debug, Clone)]
-pub struct Node {
-    /// Leaf name; internal nodes use `None`.
-    pub name: Option<String>,
-    /// Outgoing edges from this rooted representation.
-    pub children: Vec<Edge>,
-}
 
 /// Code for gaps, `N` and anything that is not A, C, G or T.
 const GAP: u8 = 4;
@@ -333,31 +320,107 @@ fn pair_key(a: u32, b: u32) -> (u32, u32) {
     (a.min(b), a.max(b))
 }
 
-fn build_nodes(names: &[String], nj: &Nj) -> (Vec<Node>, usize) {
-    let mut nodes: Vec<Node> = names
-        .iter()
-        .map(|name| Node {
-            name: Some(name.clone()),
-            children: Vec::new(),
-        })
-        .collect();
-    for (children, lengths) in nj.children.iter().zip(&nj.lengths) {
-        nodes.push(Node {
-            name: None,
-            children: vec![
-                Edge {
-                    child: children[0] as usize,
-                    len: lengths[0],
-                },
-                Edge {
-                    child: children[1] as usize,
-                    len: lengths[1],
-                },
-            ],
-        });
+/// Unrooted tree made by the joins, as adjacency lists of `(neighbour, branch length)`.
+///
+/// Leaves are `0..n` and the internal node made by join `j` is `n + j`. The last join
+/// only links the two remaining clusters, so it adds a branch rather than a node.
+fn unrooted_tree(n: usize, nj: &Nj) -> Vec<Vec<(usize, f64)>> {
+    let joins = nj.children.len();
+    let mut adjacency = vec![Vec::new(); n + joins - 1];
+    for (j, (children, lengths)) in nj.children.iter().zip(&nj.lengths).enumerate() {
+        let [a, b] = children.map(|child| child as usize);
+        if j + 1 == joins {
+            let len = lengths[0] + lengths[1];
+            adjacency[a].push((b, len));
+            adjacency[b].push((a, len));
+        } else {
+            for (child, len) in [(a, lengths[0]), (b, lengths[1])] {
+                adjacency[n + j].push((child, len));
+                adjacency[child].push((n + j, len));
+            }
+        }
     }
-    let root = nodes.len() - 1;
-    (nodes, root)
+    adjacency
+}
+
+/// Distance from `start` to every node, and the next node on the way back to `start`.
+fn distances_from(adjacency: &[Vec<(usize, f64)>], start: usize) -> (Vec<f64>, Vec<usize>) {
+    let mut distance = vec![0.0; adjacency.len()];
+    let mut towards_start = vec![start; adjacency.len()];
+    let mut stack = vec![start];
+    while let Some(node) = stack.pop() {
+        for &(next, len) in &adjacency[node] {
+            if next != towards_start[node] {
+                distance[next] = distance[node] + len;
+                towards_start[next] = node;
+                stack.push(next);
+            }
+        }
+    }
+    (distance, towards_start)
+}
+
+/// Leaf other than `start` that is farthest from it (the first one in case of ties).
+fn farthest_leaf(distance: &[f64], n: usize, start: usize) -> usize {
+    (0..n)
+        .filter(|&leaf| leaf != start)
+        .reduce(|best, leaf| {
+            if distance[leaf] > distance[best] {
+                leaf
+            } else {
+                best
+            }
+        })
+        .expect("a tree has at least 2 leaves")
+}
+
+/// Where the tree is rooted: at a node, or on the branch between two nodes, at the
+/// given distances from each.
+enum Root {
+    Node(usize),
+    Branch([(usize, f64); 2]),
+}
+
+/// Midpoint root: halfway along the longest path between two leaves.
+fn midpoint_root(adjacency: &[Vec<(usize, f64)>], n: usize) -> Root {
+    let first = farthest_leaf(&distances_from(adjacency, 0).0, n, 0);
+    let (distance, towards_first) = distances_from(adjacency, first);
+    let last = farthest_leaf(&distance, n, first);
+    let half = 0.5 * distance[last];
+    // Walk back from the far end of the path to the branch that holds the midpoint.
+    let mut node = last;
+    while distance[towards_first[node]] > half {
+        node = towards_first[node];
+    }
+    let next = towards_first[node];
+    // A midpoint on an internal node (up to rounding) roots the tree at that node.
+    let tolerance = 1e-12 * half.max(1.0);
+    for candidate in [next, node] {
+        if candidate >= n && (distance[candidate] - half).abs() <= tolerance {
+            return Root::Node(candidate);
+        }
+    }
+    Root::Branch([
+        (next, (half - distance[next]).max(0.0)),
+        (node, (distance[node] - half).max(0.0)),
+    ])
+}
+
+/// Newick tree rooted at the midpoint (see [`midpoint_root`]).
+fn midpoint_newick(names: &[String], adjacency: &[Vec<(usize, f64)>]) -> String {
+    let mut out = String::new();
+    match midpoint_root(adjacency, names.len()) {
+        Root::Node(root) => write_subtree(names, adjacency, root, usize::MAX, &mut out),
+        Root::Branch([(a, to_a), (b, to_b)]) => {
+            out.push('(');
+            write_subtree(names, adjacency, a, b, &mut out);
+            let _ = write!(out, ":{to_a:.6},");
+            write_subtree(names, adjacency, b, a, &mut out);
+            let _ = write!(out, ":{to_b:.6})");
+        }
+    }
+    out.push(';');
+    out
 }
 
 fn escape_name(name: &str) -> String {
@@ -371,28 +434,31 @@ fn escape_name(name: &str) -> String {
     }
 }
 
-fn write_subtree(nodes: &[Node], node_id: usize, out: &mut String) {
-    let node = &nodes[node_id];
-    if node.children.is_empty() {
-        out.push_str(&escape_name(node.name.as_deref().unwrap_or("")));
+/// Subtree of `node` seen from its neighbour `parent`.
+fn write_subtree(
+    names: &[String],
+    adjacency: &[Vec<(usize, f64)>],
+    node: usize,
+    parent: usize,
+    out: &mut String,
+) {
+    if node < names.len() {
+        out.push_str(&escape_name(&names[node]));
         return;
     }
     out.push('(');
-    for (position, edge) in node.children.iter().enumerate() {
-        if position != 0 {
-            out.push(',');
+    let mut first = true;
+    for &(child, len) in &adjacency[node] {
+        if child != parent {
+            if !first {
+                out.push(',');
+            }
+            first = false;
+            write_subtree(names, adjacency, child, node, out);
+            let _ = write!(out, ":{len:.6}");
         }
-        write_subtree(nodes, edge.child, out);
-        let _ = write!(out, ":{:.6}", edge.len);
     }
     out.push(')');
-}
-
-fn to_newick(nodes: &[Node], root: usize) -> String {
-    let mut out = String::new();
-    write_subtree(nodes, root, &mut out);
-    out.push(';');
-    out
 }
 
 fn validate_alignment(names: &[String], seqs: &[Vec<u8>]) -> anyhow::Result<usize> {
@@ -411,7 +477,7 @@ fn validate_alignment(names: &[String], seqs: &[Vec<u8>]) -> anyhow::Result<usiz
     Ok(len)
 }
 
-/// Neighbor-joining tree of an alignment, in Newick format.
+/// Midpoint-rooted neighbor-joining tree of an alignment, in Newick format.
 pub fn nj_tree_newick(
     names: &[String],
     seqs: &[Vec<u8>],
@@ -425,8 +491,7 @@ pub fn nj_tree_newick(
     let mut nj = Nj::new(names.len());
     nj.load(names.len(), &compute_distance_matrix(&alignment, &pool));
     nj.reduce(names.len());
-    let (nodes, root) = build_nodes(names, &nj);
-    Ok(to_newick(&nodes, root))
+    Ok(midpoint_newick(names, &unrooted_tree(names.len(), &nj)))
 }
 
 #[cfg(test)]
@@ -469,6 +534,61 @@ mod tests {
         assert_eq!(corrected_distance(10, 0), 0.0);
         let d = corrected_distance(100, 10);
         assert!((d - (-0.75 * (1.0f64 - 0.4 / 3.0).ln())).abs() < 1e-12);
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|name| name.to_string()).collect()
+    }
+
+    /// Unrooted tree from `(node, node, length)` branches.
+    fn tree(nodes: usize, branches: &[(usize, usize, f64)]) -> Vec<Vec<(usize, f64)>> {
+        let mut adjacency = vec![Vec::new(); nodes];
+        for &(a, b, len) in branches {
+            adjacency[a].push((b, len));
+            adjacency[b].push((a, len));
+        }
+        adjacency
+    }
+
+    #[test]
+    fn midpoint_splits_the_branch_halfway_along_the_longest_path() {
+        // A and B join at node 4, C and D at node 5; the longest path is A-D (7).
+        let adjacency = tree(
+            6,
+            &[
+                (4, 0, 1.0),
+                (4, 1, 1.0),
+                (5, 2, 1.0),
+                (5, 3, 5.0),
+                (4, 5, 1.0),
+            ],
+        );
+        assert_eq!(
+            midpoint_newick(&names(&["A", "B", "C", "D"]), &adjacency),
+            "(D:3.500000,(C:1.000000,(A:1.000000,B:1.000000):1.000000):1.500000);"
+        );
+    }
+
+    #[test]
+    fn a_midpoint_on_an_internal_node_roots_the_tree_there() {
+        let adjacency = tree(4, &[(3, 0, 1.0), (3, 1, 1.0), (3, 2, 0.5)]);
+        assert_eq!(
+            midpoint_newick(&names(&["A", "B", "C"]), &adjacency),
+            "(A:1.000000,B:1.000000,C:0.500000);"
+        );
+    }
+
+    #[test]
+    fn identical_sequences_give_a_valid_tree() {
+        let seqs = vec![b"ACGT".to_vec(); 3];
+        assert_eq!(
+            nj_tree_newick(&names(&["A", "B"]), &seqs[..2], 1).unwrap(),
+            "(B:0.000000,A:0.000000);"
+        );
+        let tree = nj_tree_newick(&names(&["A", "B", "C"]), &seqs, 1).unwrap();
+        for leaf in ["A", "B", "C"] {
+            assert_eq!(tree.matches(leaf).count(), 1, "{tree}");
+        }
     }
 
     #[test]
