@@ -1,6 +1,6 @@
 <h1 align="center">noref</h1>
 
-noref ('no reference' needed) is designed for within-species phylogenetic analyses (population genomics) from genome assemblies, in a fast and easy way. It is only recommended for bacterial species and only accepts genome assemblies as input (not sequencing reads).
+noref ('no reference' genome needed) is designed for within-species phylogenetic analyses (population genomics) from genome assemblies, in a fast and easy way. It is only recommended for bacterial species and only accepts genome assemblies as input (not sequencing reads).
 
 Reference-free variant callers have to fall back on a reference genome to deal with recombination: SNPs are mapped onto a reference genome, and recombination tracts are then detected and removed by another tool (e.g. [ClonalFrameML](https://github.com/xavierdidelot/ClonalFrameML), [Gubbins](https://github.com/nickjcroucher/gubbins) or [Verticall](https://github.com/rrwick/Verticall)).
 noref was developed to perform both steps, SNP calling and detection of recombination tracts, without a reference genome.
@@ -47,7 +47,7 @@ This dataset corresponds to the Euro-GASP 2020 study published by [Golparian et 
 [TBC] bacterial genome assemblies in a directory with `-i`, or paths of input files provided in a headerless tab-delimited file using the `-I` argument (see [here](https://github.com/rderelle/kamino#input) for more details).
 
 ## output
-[TBC] SNP alignments (with some constant positions; not a pseudo-alignment of genomes), NJ trees with `--nj`, and a recombination gff file for [Phandango](https://github.com/jameshadfield/phandango) with `-p`/`--plot`.
+[TBC] SNP alignments (with some constant positions; not a pseudo-alignment of genomes), midpoint rooted NJ trees with `--nj`, and a recombination gff file for [Phandango](https://github.com/jameshadfield/phandango) with `-p`/`--plot`.
 For the latter, the name of the isolate whose genome the recombinant SNPs will be mapped onto should be indicated.
 
 
