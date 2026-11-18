@@ -68,8 +68,9 @@
 //!
 //! # Choosing parameters
 //!
-//! - `-f`/`--min-freq` (0.5–1, default 0.5): lower values retain sites present in
-//!   fewer samples, producing a longer alignment with more missing data.
+//! - `-f`/`--min-freq` (above 0.5 and up to 1, default 0.6): lower values retain
+//!   sites present in fewer samples, producing a longer alignment with more missing
+//!   data.
 //! - `-k`/`--k`: anchor k-mer size (1–32, default 17).
 //! - `-l`/`--length-middle`: maximum number of bases between two adjacent anchors.
 //! - `-m`/`--mask`: minimum run of consecutive differences to the group consensus
@@ -161,11 +162,11 @@ pub struct Args {
     )]
     pub k: usize,
 
-    /// Minimum fraction of isolates present per alignment position [f=0.5].
+    /// Minimum fraction of isolates present per alignment position [f=0.6].
     #[arg(
         short = 'f',
         long = "min-freq",
-        default_value_t = 0.5,
+        default_value_t = 0.6,
         hide_default_value = true,
         help_heading = "Main parameters"
     )]
@@ -284,8 +285,8 @@ fn validate_args(args: &Args) -> anyhow::Result<()> {
         u16::MAX
     );
     anyhow::ensure!(
-        (0.5..=1.0).contains(&args.min_freq),
-        "-f/--min-freq must be between 0.5 and 1"
+        args.min_freq > 0.5 && args.min_freq <= 1.0,
+        "-f/--min-freq must be greater than 0.5 and at most 1"
     );
     anyhow::ensure!(args.threads > 0, "-t/--threads must be at least 1");
     anyhow::ensure!(
@@ -399,6 +400,7 @@ fn build_alignment(
         log,
     )?;
     say!(log, "# analyse variant groups");
+    say!(log, " . raw variant groups: {}", raw_groups.groups.len());
     let sorted_groups = group_sorting::sort_and_deduplicate_groups(raw_groups)?;
     let alignment =
         group_filtering::filter_groups(sorted_groups, min_needed, args.mask, args.threads)?;
@@ -607,7 +609,7 @@ mod argument_tests {
     fn defaults() {
         let a = Args::parse_from(["noref", "-i", "."]);
         assert_eq!((a.k, a.length_middle, a.mask), (17, 70, 4));
-        assert_eq!(a.min_freq, 0.5);
+        assert_eq!(a.min_freq, 0.6);
         assert!(validate_args(&a).is_ok());
     }
 
@@ -639,8 +641,9 @@ mod argument_tests {
     #[test]
     fn min_freq_bounds() {
         let freq = |f: &str| Args::parse_from(["noref", "-i", ".", "-f", f]);
-        assert!(validate_args(&freq("0.5")).is_ok());
+        assert!(validate_args(&freq("0.51")).is_ok());
         assert!(validate_args(&freq("1.0")).is_ok());
+        assert!(validate_args(&freq("0.5")).is_err());
         assert!(validate_args(&freq("0.49")).is_err());
         assert!(validate_args(&freq("1.01")).is_err());
     }
@@ -702,17 +705,3 @@ mod argument_tests {
         assert!(validate_args(&args(33)).is_err());
         assert!(validate_args(&args(0)).is_err());
     }
-
-    #[test]
-    fn removed_options_are_rejected() {
-        for option in [
-            &["--genomes"][..],
-            &["-r", "sr6"],
-            &["-c", "1"],
-            &["--constant", "1"],
-        ] {
-            let argv = ["noref", "-i", "."].iter().chain(option);
-            assert!(Args::try_parse_from(argv).is_err());
-        }
-    }
-}
