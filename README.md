@@ -1,7 +1,6 @@
 <h1 align="center">noref</h1>
 
-noref ('no reference') is designed for within-species phylogenetic analyses (population genomics) from genome assemblies, in a fast and easy way.
-It is only recommended for bacterial species and only accepts genome assemblies as input (not sequencing reads).
+noref ('no reference' needed) is designed for within-species phylogenetic analyses (population genomics) from genome assemblies, in a fast and easy way. It is only recommended for bacterial species and only accepts genome assemblies as input (not sequencing reads).
 
 Reference-free variant callers, such as [SKA](https://github.com/bacpop/ska.rust), have to fall back on a reference genome to deal with recombination: SNPs are mapped onto a reference genome, and recombination tracts are then detected and removed by another tool (e.g. [ClonalFrameML](https://github.com/xavierdidelot/ClonalFrameML), [Gubbins](https://github.com/nickjcroucher/gubbins) or [Verticall](https://github.com/rrwick/Verticall)).
 noref was developed to perform both steps, SNP calling and detection of recombination tracts, without a reference genome.
@@ -29,16 +28,16 @@ noref -i <input_dir> -t 4 --nj
 # also get a recombination gff file for Phandango, on the genome of isolate 'ncbi_species_1'
 noref -i <input_dir> -t 4 --plot ncbi_species_1
 ```
-## some examples
-Genome assemblies from AllTheBacteria project. noref ran with default values and tree midpoint rooted. Runtimes in seconds and memory usage in GB RAM were recorded on a MacBook Pro M4 laptop.
+## examples
+Genome assemblies were obtained from the AllTheBacteria project. noref was run with default parameters, and the resulting phylogenetic trees were midpoint-rooted. Runtimes (seconds) and RAM usage (GB) were measured on a MacBook Pro M4.
 
 #### 171 S. pneumoniae genomes (4s/0.7GB)
-This dataset corresponds to the PMEN2 group analysed in [Croucher et al 2014](https://link.springer.com/article/10.1186/1741-7007-12-49). The recombination plot is very similar to the one generated in this publication, with recombination hotspots aligning with transposons (see also Sup. Mat. of [this paper](https://academic.oup.com/mbe/article/42/4/msaf077/8103706) for Gubbins analyses of this dataset).
+This dataset corresponds to the PMEN2 group analysed by [Croucher et al 2014](https://link.springer.com/article/10.1186/1741-7007-12-49). The inferred recombination pattern closely resembles that reported in the original study, including recombination hotspots associated with transposons. Gubbins analyses of the same dataset are also available in the Supplementary Material of [this paper](https://academic.oup.com/mbe/article/42/4/msaf077/8103706)).
 ![noref result for the pneumo dataset](images/pneumo.png)
 
 #### 1932 N. gonnorahea genomes (64s/4.3GB)
-This dataset corresponds to the Euro-GASP 2020 study published by [Golparian et al 2024](https://www.thelancet.com/journals/lanmic/article/PIIS2666-5247(23)00370-1/fulltext).
-
+This dataset corresponds to the Euro-GASP 2020 study published by [Golparian et al 2024](https://www.thelancet.com/journals/lanmic/article/PIIS2666-5247(23)00370-1/fulltext). Although I haven't checked the locations of recombination hotspots, the overall recombination pattern is consistent with published Gubbins analyses (see examples [here](https://jameshadfield.github.io/phandango/#/examples) and [here](https://pmc.ncbi.nlm.nih.gov/articles/PMC6998845/))
+![noref result for the pneumo dataset](images/neisseria.png)
 
 ## input
 [TBC] bacterial genome assemblies in a directory with `-i`, or paths of input files provided in a headerless tab-delimited file using the `-I` argument [kamino](https://github.com/rderelle/kamino#input).
