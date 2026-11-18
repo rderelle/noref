@@ -6,6 +6,8 @@ Reference-free variant callers, such as [SKA](https://github.com/bacpop/ska.rust
 noref was developed to perform both steps, SNP calling and detection of recombination tracts, without a reference genome.
 This reduces biases and greatly simplifies phylogenetic workflows: there is no need to choose a closely related reference genome, and one tool does everything.
 
+Please note that this tool is still under development.
+
 ## under the hood
 - SNP calling: this is essentially the algorithm developed in [kamino](https://github.com/rderelle/kamino), but using nucleotides instead of amino acids. Also, the genomic positions in the original input assemblies of each extracted sequence from each variant group are saved in memory instead of protein names, allowing the next step to happen.
 - detection of recombination: SNPs are first clustered by isolate profile. Then each input assembly is scanned for local enrichment of each SNP cluster independently, using a window scan and a binomial test (p-value threshold with Bonferroni correction): SNPs in significant windows are masked in the corresponding isolate.
