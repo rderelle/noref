@@ -47,7 +47,7 @@ This dataset corresponds to the Euro-GASP 2020 study published by [Golparian et 
 [TBC] bacterial genome assemblies in a directory with `-i`, or paths of input files provided in a headerless tab-delimited file using the `-I` argument [kamino](https://github.com/rderelle/kamino#input).
 
 ## output
-[TBC] SNP alignments, NJ trees with `--nj`, and a recombination gff file for [Phandango](https://github.com/jameshadfield/phandango) with `-p`/`--plot`.
+[TBC] SNP alignments (with some constant positions; not a pseudo-alignment of genomes), NJ trees with `--nj`, and a recombination gff file for [Phandango](https://github.com/jameshadfield/phandango) with `-p`/`--plot`.
 For the latter, the name of the isolate whose genome the recombinant SNPs will be mapped onto should be indicated.
 
 
