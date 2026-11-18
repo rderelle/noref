@@ -27,8 +27,8 @@ noref -i <input_dir> -t 4
 # also get NJ trees (of the raw and filtered SNP alignments)
 noref -i <input_dir> -t 4 --nj
 
-# also get a recombination gff file for Phandango, on the genome of isolate 'ncbi_species_1'
-noref -i <input_dir> -t 4 --plot ncbi_species_1
+# also get a recombination gff file for Phandango, on the genome of isolate '670-6B'
+noref -i <input_dir> -t 4 --plot 670-6B
 ```
 ## examples
 Genome assemblies were obtained from the AllTheBacteria project. noref was run with default parameters, and the resulting phylogenetic trees were midpoint-rooted. Runtimes (seconds) and RAM usage (GB) were measured on a MacBook Pro M4.
