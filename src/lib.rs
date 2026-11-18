@@ -705,3 +705,4 @@ mod argument_tests {
         assert!(validate_args(&args(33)).is_err());
         assert!(validate_args(&args(0)).is_err());
     }
+}
