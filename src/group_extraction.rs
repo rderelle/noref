@@ -72,7 +72,7 @@ impl Progress {
         const WIDTH: usize = 45;
         let filled = (current * WIDTH).checked_div(self.total).unwrap_or(WIDTH);
         eprint!(
-            "\r  \x1b[34m[{}{}]\x1b[0m {}/{} genome files",
+            "\r  \x1b[32m[{}{}]\x1b[0m {}/{} genome files",
             "=".repeat(filled),
             " ".repeat(WIDTH - filled),
             current,

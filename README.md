@@ -27,8 +27,8 @@ noref -i <input_dir> -t 4
 # also get NJ trees (of the raw and filtered SNP alignments)
 noref -i <input_dir> -t 4 --nj
 
-# also get a recombination gff file for Phandango, on the genome of isolate 'ncbi_species_1'
-noref -i <input_dir> -t 4 --plot ncbi_species_1
+# also get a recombination gff file for Phandango, on the genome of isolate '670-6B'
+noref -i <input_dir> -t 4 --plot 670-6B
 ```
 ## examples
 Genome assemblies were obtained from the AllTheBacteria project. noref was run with default parameters, and the resulting phylogenetic trees were midpoint-rooted. Runtimes (seconds) and RAM usage (GB) were measured on a MacBook Pro M4.
@@ -44,10 +44,10 @@ This dataset corresponds to the Euro-GASP 2020 study published by [Golparian et 
 ![noref result for the pneumo dataset](images/neisseria.png)
 
 ## input
-[TBC] bacterial genome assemblies in a directory with `-i`, or paths of input files provided in a headerless tab-delimited file using the `-I` argument [kamino](https://github.com/rderelle/kamino#input).
+[TBC] bacterial genome assemblies in a directory with `-i`, or paths of input files provided in a headerless tab-delimited file using the `-I` argument (see [here](https://github.com/rderelle/kamino#input) for more details).
 
 ## output
-[TBC] SNP alignments, NJ trees with `--nj`, and a recombination gff file for [Phandango](https://github.com/jameshadfield/phandango) with `-p`/`--plot`.
+[TBC] SNP alignments (with some constant positions; not a pseudo-alignment of genomes), NJ trees with `--nj`, and a recombination gff file for [Phandango](https://github.com/jameshadfield/phandango) with `-p`/`--plot`.
 For the latter, the name of the isolate whose genome the recombinant SNPs will be mapped onto should be indicated.
 
 
