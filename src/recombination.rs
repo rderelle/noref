@@ -20,8 +20,17 @@
 //! boundary are not adjacent in the genome: windows near a contig end are shortened to
 //! it and tested against the same critical weight. A shortened window can only hold
 //! fewer SNPs than a full one, so this keeps the test conservative.
+//!
+//! The SNPs of an isolate are sorted by position once; the SNPs of a cluster are then
+//! sorted by their rank in that order. Three shortcuts give the same results as
+//! scanning every window of every cluster with the exact critical weight: most clusters
+//! have no significant window, which a bound of their window weights shows before their
+//! SNPs are sorted (see [`WindowBound`]); the critical weight is only computed as
+//! precisely as the comparisons need (see [`CriticalWeight`]); and the last round,
+//! which flags nothing, is mostly skipped (see [`scan_cluster`]).
 use hashbrown::HashMap;
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use crate::group_filtering::NO_POSITION;
 
@@ -49,11 +58,10 @@ pub(crate) struct RecombinationStats {
 
 /// Inputs describing where each SNP lies.
 pub(crate) struct SnpLayout<'a> {
-    /// Alignment column and cluster of each SNP, in column order (a SNP split
-    /// between several clusters appears once per cluster).
+    /// Alignment column and pattern of each SNP, in column order.
     pub(crate) snps: &'a [(u32, u32)],
-    /// Weight of each entry of `snps` (1, or a fraction for split SNPs).
-    pub(crate) weights: &'a [f64],
+    /// Clusters of each pattern: a SNP split between `n` clusters counts `1/n` in each.
+    pub(crate) pattern_clusters: &'a [Vec<u32>],
     pub(crate) n_clusters: usize,
     /// Alignment column just after the last column of each variant group.
     pub(crate) group_ends: &'a [u32],
@@ -61,6 +69,44 @@ pub(crate) struct SnpLayout<'a> {
     pub(crate) positions: &'a [u32],
     /// Per isolate: end of each contig in the genome (contigs placed end to end).
     pub(crate) contig_ends: &'a [Vec<u32>],
+}
+
+/// A SNP of a cluster, placed on the genome of an isolate.
+#[derive(Clone, Copy, Debug)]
+struct Snp {
+    pos: u32,
+    /// End (excluded) of the window starting at this SNP: `pos + w`, or the end of its
+    /// contig if that comes first.
+    limit: u32,
+    column: u32,
+    weight: f64,
+}
+
+/// SNPs given as (position, column, weight), sorted by position, placed on a genome
+/// whose contigs end at `contig_ends`, with windows of `window` bases.
+fn place(
+    snps: impl Iterator<Item = (u32, u32, f64)>,
+    contig_ends: &[u32],
+    window: u32,
+) -> Vec<Snp> {
+    let mut contig = 0;
+    snps.map(|(pos, column, weight)| {
+        // Positions are sorted, so the contig index only moves forward.
+        while contig < contig_ends.len() && contig_ends[contig] <= pos {
+            contig += 1;
+        }
+        // A position past the last contig starts no window.
+        let limit = contig_ends.get(contig).map_or(pos, |&end| {
+            (pos as u64 + window as u64).min(end as u64) as u32
+        });
+        Snp {
+            pos,
+            limit,
+            column,
+            weight,
+        }
+    })
+    .collect()
 }
 
 /// Smallest count `c` such that P(Binomial(k, p) >= c) < `threshold`, or `None` when
@@ -166,142 +212,340 @@ fn beta_inc(a: f64, b: f64, x: f64) -> f64 {
     }
 }
 
-/// Smallest weight `x` such that the binomial
-/// upper tail, extended to real counts as P(X >= x) = I_p(x, k - x + 1), is below
-/// `threshold`; `None` when even `x = k` is not significant. For whole `k` and whole
-/// counts this gives the same decisions as `critical_count`.
-fn critical_weight(k: f64, p: f64, threshold: f64) -> Option<f64> {
-    if k <= 0.0 || p >= 1.0 {
-        return None;
+/// Critical weight for SNPs of total weight `k`: the smallest weight `x` such that the
+/// binomial upper tail, extended to real counts as P(X >= x) = I_p(x, k - x + 1), is
+/// below `threshold`. It is found by bisection, to within 1e-10, but the bisection is
+/// only carried as far as needed to compare window weights with it: whatever the
+/// remaining steps, a weight of at least `hi` (minus [`TOLERANCE`]) reaches the
+/// critical weight and a weight below `lo` (minus [`TOLERANCE`]) does not. Windows are
+/// therefore found significant exactly as with the critical weight of the complete
+/// bisection, in a fraction of its steps.
+struct CriticalWeight {
+    k: f64,
+    p: f64,
+    threshold: f64,
+    lo: f64,
+    hi: f64,
+}
+
+impl CriticalWeight {
+    /// `None` when even the weight `k` is not significant.
+    fn new(k: f64, p: f64, threshold: f64) -> Option<Self> {
+        let critical = Self {
+            k,
+            p,
+            threshold,
+            lo: 0.0,
+            hi: k,
+        };
+        (k > 0.0 && p < 1.0 && critical.tail(k) < threshold).then_some(critical)
     }
-    let tail = |x: f64| beta_inc(x, k - x + 1.0, p);
-    if tail(k) >= threshold {
-        return None;
+
+    fn tail(&self, x: f64) -> f64 {
+        beta_inc(x, self.k - x + 1.0, self.p)
     }
-    let (mut lo, mut hi) = (0.0f64, k);
-    while hi - lo > 1e-10 {
-        let mid = 0.5 * (lo + hi);
-        if tail(mid) < threshold {
-            hi = mid;
+
+    /// One step of the bisection; false once it has converged (to `hi`).
+    fn narrow(&mut self) -> bool {
+        if self.hi - self.lo <= 1e-10 {
+            return false;
+        }
+        let mid = 0.5 * (self.lo + self.hi);
+        if self.tail(mid) < self.threshold {
+            self.hi = mid;
         } else {
-            lo = mid;
+            self.lo = mid;
+        }
+        true
+    }
+
+    /// Whether a window of this weight is significant.
+    fn reached_by(&mut self, weight: f64) -> bool {
+        loop {
+            if weight >= self.hi - TOLERANCE {
+                return true;
+            }
+            if weight < self.lo - TOLERANCE || !self.narrow() {
+                return false;
+            }
         }
     }
-    Some(hi)
 }
 
-/// Critical weight for SNPs of total weight `k`, or `None` when no window can be
-/// significant: either no weight is, or `heaviest`, the weight of the heaviest window,
-/// is too low.
-///
-/// The bisection of [`critical_weight`] takes about forty evaluations of the tail, and
-/// most clusters of an isolate have no significant window. As the tail decreases when
-/// the weight increases, these cases are settled with one evaluation, slightly above
-/// `heaviest`: if even that weight is not significant, the critical weight is higher
-/// still and no window reaches it. `QUICK_EXIT_MARGIN` is far larger than the precision
-/// of the bisection and than [`TOLERANCE`], so the windows found significant are the
-/// same as when the critical weight is always computed. Critical weights are kept in
-/// `known`.
-fn critical_weight_if_reached(
-    k: f64,
-    heaviest: f64,
-    p: f64,
-    threshold: f64,
-    known: &mut HashMap<u64, Option<f64>>,
-) -> Option<f64> {
-    const QUICK_EXIT_MARGIN: f64 = 1e-6;
-    if let Some(&critical) = known.get(&k.to_bits()) {
-        return critical;
-    }
-    let x = heaviest + QUICK_EXIT_MARGIN;
-    if beta_inc(x, k - x + 1.0, p) >= threshold {
-        return None;
-    }
-    let critical = critical_weight(k, p, threshold);
-    known.insert(k.to_bits(), critical);
-    critical
+/// The critical weight of the complete bisection; `None` when even `x = k` is not
+/// significant. For whole `k` and whole counts this gives the same decisions as
+/// `critical_count`.
+#[cfg(test)]
+fn critical_weight(k: f64, p: f64, threshold: f64) -> Option<f64> {
+    let mut critical = CriticalWeight::new(k, p, threshold)?;
+    while critical.narrow() {}
+    Some(critical.hi)
 }
 
-/// Flag SNPs in significant windows, iterating until no new SNP is flagged.
-/// `snps` holds (position, column, weight) sorted by position; flagged columns are
-/// appended to `masked`. Windows are shortened to the end of their contig
-/// (`contig_ends`). A window is significant when it holds at least two SNPs whose
-/// summed weight reaches the critical weight for the cluster's total weight `K`.
+/// An upper bound of window weights obtained otherwise than these weights (with sums
+/// in another order, or `f32` weights), raised far above its rounding errors, and far
+/// above [`TOLERANCE`]. If it is not significant, no window is.
+fn raised(bound: f64) -> f64 {
+    bound * (1.0 + 1e-6) + 1e-6
+}
+
+/// Bound of the weight of the windows of a cluster, computed without sorting its SNPs:
+/// a window of `w` bases lies within three consecutive bins of `w / 2` bases (rounded
+/// up), the first of which holds the SNP it starts at.
+struct WindowBound {
+    width: u32,
+    bins: Vec<f64>,
+    /// Bins holding SNPs: the first `n_filled`, and room for one more.
+    filled: Vec<u32>,
+    n_filled: usize,
+}
+
+impl WindowBound {
+    fn new(genome: u32, window: u32) -> Self {
+        let width = window.div_ceil(2);
+        let n_bins = (genome / width) as usize + 1;
+        Self {
+            width,
+            bins: vec![0.0; n_bins],
+            filled: vec![0; n_bins + 1],
+            n_filled: 0,
+        }
+    }
+
+    /// Bin of a position (a SNP past the end of the genome is in no window: any bin
+    /// will do).
+    fn bin(&self, pos: u32) -> u32 {
+        (pos / self.width).min(self.bins.len() as u32 - 1)
+    }
+
+    fn add(&mut self, bin: u32, weight: f32) {
+        // Without a branch: the bin is kept in `filled` only if it was empty.
+        self.filled[self.n_filled] = bin;
+        self.n_filled += (self.bins[bin as usize] == 0.0) as usize;
+        self.bins[bin as usize] += weight as f64;
+    }
+
+    /// Whether a window of the SNPs added since the last call may be significant (if
+    /// not, none is). The bins are emptied.
+    fn may_be_significant(&mut self, p: f64, threshold: f64) -> bool {
+        let filled = &self.filled[..self.n_filled];
+        let bins = &self.bins;
+        let heaviest = filled
+            .iter()
+            .map(|&b| {
+                bins[b as usize..bins.len().min(b as usize + 3)]
+                    .iter()
+                    .sum()
+            })
+            .fold(0.0, f64::max);
+        let mut k = 0.0;
+        for &b in filled {
+            k += self.bins[b as usize];
+            self.bins[b as usize] = 0.0;
+        }
+        self.n_filled = 0;
+        // The tail increases with `k`: lowering `k` covers the `f32` weights.
+        let (x, k) = (raised(heaviest), k * (1.0 - 1e-6));
+        x >= k || beta_inc(x, k - x + 1.0, p) < threshold
+    }
+}
+
+/// Calls `f(start, end)` for each window holding at least two SNPs: the window
+/// starting at SNP `start` holds the SNPs up to `end` (excluded). `snps` are sorted by
+/// position.
+fn for_each_window(snps: &[Snp], mut f: impl FnMut(usize, usize)) {
+    let mut end = 0;
+    for (start, snp) in snps.iter().enumerate() {
+        // Window limits never decrease, so `end` only moves forward.
+        end = end.max(start);
+        while end < snps.len() && snps[end].pos < snp.limit {
+            end += 1;
+        }
+        if end - start >= 2 {
+            f(start, end);
+        }
+    }
+}
+
+/// Buffers reused by [`scan_cluster`].
+#[derive(Default)]
+struct Scratch {
+    prefix: Vec<f64>,
+    flagged: Vec<bool>,
+}
+
+/// Flag SNPs in significant windows, round after round until no new SNP is flagged.
+/// `snps` are sorted by position; flagged columns are appended to `masked`. A window
+/// is significant when it holds at least two SNPs whose summed weight reaches the
+/// critical weight for the cluster's total weight `K`, kept for each `K` in `known`.
 fn scan_cluster(
-    snps: &mut Vec<(u32, u32, f64)>,
-    contig_ends: &[u32],
-    window: u32,
+    snps: &mut Vec<Snp>,
     p: f64,
     threshold: f64,
-    critical: &mut HashMap<u64, Option<f64>>,
+    known: &mut HashMap<u64, Option<CriticalWeight>>,
+    scratch: &mut Scratch,
     masked: &mut Vec<u32>,
 ) {
-    let mut flagged = Vec::new();
-    let mut prefix = Vec::new();
-    // Windows holding at least two SNPs: index of their first SNP, and of their last
-    // SNP plus one.
-    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let Scratch { prefix, flagged } = scratch;
+    // Heaviest window left unflagged by the previous round. Removing flagged SNPs only
+    // lowers the weight of the remaining windows: a round flags nothing new unless
+    // this weight reaches the new critical weight.
+    let mut unflagged = f64::INFINITY;
     loop {
         prefix.clear();
         prefix.push(0.0f64);
-        for &(_, _, w) in snps.iter() {
-            prefix.push(prefix.last().unwrap() + w);
+        for snp in snps.iter() {
+            prefix.push(prefix[prefix.len() - 1] + snp.weight);
         }
-        let k = *prefix.last().unwrap();
-        spans.clear();
-        let mut end = 0;
-        let mut contig = 0;
-        for start in 0..snps.len() {
-            // Positions are sorted, so the contig index only moves forward.
-            while contig < contig_ends.len() && contig_ends[contig] <= snps[start].0 {
-                contig += 1;
-            }
-            let Some(&contig_end) = contig_ends.get(contig) else {
-                break;
-            };
-            // The window ends at p + w or at the contig end, whichever comes first;
-            // this limit never decreases, so `end` only moves forward.
-            let limit = (snps[start].0 as u64 + window as u64).min(contig_end as u64);
-            end = end.max(start);
-            while end < snps.len() && (snps[end].0 as u64) < limit {
-                end += 1;
-            }
-            if end - start >= 2 {
-                spans.push((start, end));
-            }
-        }
-        if spans.is_empty() {
-            return;
-        }
-        let weight = |&(start, end): &(usize, usize)| prefix[end] - prefix[start];
-        let heaviest = spans.iter().map(weight).fold(0.0, f64::max);
-        let Some(c) = critical_weight_if_reached(k, heaviest, p, threshold, critical) else {
+        let k = prefix[snps.len()];
+        let weight = |start: usize, end: usize| prefix[end] - prefix[start];
+        let critical = known
+            .entry(k.to_bits())
+            .or_insert_with(|| CriticalWeight::new(k, p, threshold));
+        let Some(critical) = critical else {
             return;
         };
+        if !critical.reached_by(raised(unflagged)) {
+            return;
+        }
         flagged.clear();
         flagged.resize(snps.len(), false);
-        let mut new = 0;
-        for span in &spans {
-            if weight(span) >= c - TOLERANCE {
-                for f in &mut flagged[span.0..span.1] {
-                    new += !*f as usize;
-                    *f = true;
-                }
+        // Window ends never decrease: SNPs before `flagged_end` are already flagged.
+        let mut flagged_end = 0;
+        unflagged = 0.0;
+        for_each_window(snps, |start, end| {
+            let w = weight(start, end);
+            if critical.reached_by(w) {
+                flagged[start.max(flagged_end)..end].fill(true);
+                flagged_end = end;
+            } else {
+                unflagged = unflagged.max(w);
             }
-        }
-        if new == 0 {
+        });
+        if flagged_end == 0 {
             return;
         }
         let mut i = 0;
-        snps.retain(|&(_, column, _)| {
+        snps.retain(|snp| {
             let keep = !flagged[i];
             if !keep {
-                masked.push(column);
+                masked.push(snp.column);
             }
             i += 1;
             keep
         });
     }
+}
+
+/// Flag the SNPs concentrated along the genome of an isolate, whose alignment row is
+/// `row`. `snp_groups` holds the variant group and weight of each SNP, and
+/// `cluster_snps[c]` the SNPs of cluster `c`. Returns the SNP cells with a base and a
+/// position (each column counted once) and the flagged columns, in ascending order.
+fn flag_isolate(
+    isolate: usize,
+    row: &[u8],
+    layout: &SnpLayout,
+    snp_groups: &[(u32, f64)],
+    cluster_snps: &[&[u32]],
+    window: u32,
+    alpha: f64,
+) -> (usize, Vec<u32>) {
+    // Genome position of each variant group in this isolate.
+    let positions: Vec<u32> = layout
+        .positions
+        .iter()
+        .skip(isolate)
+        .step_by(layout.contig_ends.len())
+        .copied()
+        .collect();
+    let contig_ends = &layout.contig_ends[isolate];
+    let genome = contig_ends.last().copied().unwrap_or(0);
+    let p = window as f64 / genome.max(1) as f64;
+    let threshold = alpha / (genome as f64 / window as f64).max(1.0);
+    // SNPs with a base and a position, sorted by position then column (as
+    // `(position << 32) | SNP`).
+    let mut sorted: Vec<u64> = Vec::new();
+    let (mut cells, mut last) = (0, u32::MAX);
+    for (s, &(column, _)) in layout.snps.iter().enumerate() {
+        let pos = positions[snp_groups[s].0 as usize];
+        let with_data =
+            matches!(row[column as usize], b'A' | b'C' | b'G' | b'T') && pos != NO_POSITION;
+        if with_data {
+            sorted.push((pos as u64) << 32 | s as u64);
+        }
+        if column != last {
+            last = column;
+            cells += with_data as usize;
+        }
+    }
+    if genome == 0 {
+        return (cells, Vec::new());
+    }
+    sorted.sort_unstable();
+    // Rank in genome order of each SNP (the SNPs of a cluster are sorted by sorting
+    // their ranks), and its bin and weight for `bound`; `u32::MAX` without data.
+    let mut bound = WindowBound::new(genome, window);
+    let mut rank = vec![u32::MAX; layout.snps.len()];
+    let mut binned = vec![(u32::MAX, 0f32); layout.snps.len()];
+    for (r, &key) in sorted.iter().enumerate() {
+        let s = key as u32 as usize;
+        rank[s] = r as u32;
+        binned[s] = (bound.bin((key >> 32) as u32), snp_groups[s].1 as f32);
+    }
+    let in_genome_order = place(
+        sorted.iter().map(|&key| {
+            let s = key as u32 as usize;
+            ((key >> 32) as u32, layout.snps[s].0, snp_groups[s].1)
+        }),
+        contig_ends,
+        window,
+    );
+    drop(sorted);
+
+    let mut masked = Vec::new();
+    // Critical weight for each total weight K (keyed by its bits).
+    let mut known: HashMap<u64, Option<CriticalWeight>> = HashMap::new();
+    let mut ranks: Vec<u32> = Vec::new();
+    let mut snps: Vec<Snp> = Vec::new();
+    let mut scratch = Scratch::default();
+    for cluster in cluster_snps {
+        for &s in cluster.iter() {
+            let (b, w) = binned[s as usize];
+            if b != u32::MAX {
+                bound.add(b, w);
+            }
+        }
+        // Most clusters have no significant window, which the bound shows without
+        // sorting their SNPs.
+        if !bound.may_be_significant(p, threshold) {
+            continue;
+        }
+        ranks.clear();
+        ranks.extend(
+            cluster
+                .iter()
+                .map(|&s| rank[s as usize])
+                .filter(|&r| r != u32::MAX),
+        );
+        if ranks.len() < 2 {
+            continue;
+        }
+        ranks.sort_unstable();
+        snps.clear();
+        snps.extend(ranks.iter().map(|&r| in_genome_order[r as usize]));
+        scan_cluster(
+            &mut snps,
+            p,
+            threshold,
+            &mut known,
+            &mut scratch,
+            &mut masked,
+        );
+    }
+    // A SNP split between clusters is masked if flagged in any of them.
+    masked.sort_unstable();
+    masked.dedup();
+    (cells, masked)
 }
 
 /// Mask, in each isolate's alignment row, the SNPs found concentrated along its genome.
@@ -316,100 +560,64 @@ pub(crate) fn mask_recombinant_snps(
     num_threads: usize,
     keep_original_bases: bool,
 ) -> anyhow::Result<RecombinationStats> {
-    let n = rows.len();
-    // SNPs ordered by cluster (then column), with each SNP's variant group.
+    // Variant group and weight of each SNP.
     let mut group = 0usize;
-    let mut snp_group = Vec::with_capacity(layout.snps.len());
-    for &(column, _) in layout.snps {
-        while layout.group_ends[group] <= column {
-            group += 1;
-        }
-        snp_group.push(group as u32);
-    }
-    let mut by_cluster: Vec<u32> = (0..layout.snps.len() as u32).collect();
-    by_cluster.sort_by_key(|&s| layout.snps[s as usize].1);
-    // Column, variant group and weight of the SNPs of each cluster, stored in the
-    // order in which every isolate reads them.
-    let by_cluster: Vec<(u32, u32, f64)> = by_cluster
+    let snp_groups: Vec<(u32, f64)> = layout
+        .snps
         .iter()
-        .map(|&s| {
-            let s = s as usize;
-            (layout.snps[s].0, snp_group[s], layout.weights[s])
+        .map(|&(column, pattern)| {
+            while layout.group_ends[group] <= column {
+                group += 1;
+            }
+            let clusters = layout.pattern_clusters[pattern as usize].len();
+            (group as u32, 1.0 / clusters as f64)
         })
         .collect();
-    let mut cluster_bounds = vec![0usize; layout.n_clusters + 1];
-    for &(_, cluster) in layout.snps {
-        cluster_bounds[cluster as usize + 1] += 1;
+    // SNPs of each cluster, in column order.
+    let clusters_of = |&(_, pattern): &(u32, u32)| &layout.pattern_clusters[pattern as usize];
+    let mut bounds = vec![0usize; layout.n_clusters + 1];
+    for &c in layout.snps.iter().flat_map(clusters_of) {
+        bounds[c as usize + 1] += 1;
     }
     for c in 0..layout.n_clusters {
-        cluster_bounds[c + 1] += cluster_bounds[c];
+        bounds[c + 1] += bounds[c];
     }
+    let mut all_cluster_snps = vec![0u32; bounds[layout.n_clusters]];
+    let mut next = bounds.clone();
+    for (s, snp) in layout.snps.iter().enumerate() {
+        for &c in clusters_of(snp) {
+            all_cluster_snps[next[c as usize]] = s as u32;
+            next[c as usize] += 1;
+        }
+    }
+    let cluster_snps: Vec<&[u32]> = bounds
+        .windows(2)
+        .map(|b| &all_cluster_snps[b[0]..b[1]])
+        .collect();
 
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(num_threads.max(1))
         .build()?;
-    type IsolateResult = (usize, Vec<u32>, Vec<(u32, u8)>);
+    // Columns masked in at least one isolate, one bit per column. Each isolate's
+    // masked columns are only kept with `keep_original_bases`.
+    let n_columns = rows.first().map_or(0, Vec::len);
+    let column_masked: Vec<AtomicU64> = (0..n_columns.div_ceil(64))
+        .map(|_| AtomicU64::new(0))
+        .collect();
+    type IsolateResult = (usize, usize, Vec<(u32, u8)>);
     let per_isolate: Vec<IsolateResult> = pool.install(|| {
         rows.par_iter_mut()
             .enumerate()
             .map(|(isolate, row)| {
-                let contig_ends = &layout.contig_ends[isolate];
-                let genome = contig_ends.last().copied().unwrap_or(0);
-                // Genome position of each variant group in this isolate.
-                let positions: Vec<u32> = layout
-                    .positions
-                    .iter()
-                    .skip(isolate)
-                    .step_by(n)
-                    .copied()
-                    .collect();
-                let mut cells = 0;
-                let mut masked = Vec::new();
-                let p = window as f64 / genome.max(1) as f64;
-                let threshold = alpha / (genome as f64 / window as f64).max(1.0);
-                // Critical weight for each total weight K (keyed by its bits).
-                let mut critical: HashMap<u64, Option<f64>> = HashMap::new();
-                // SNP cells with a base and a position (each column counted once).
-                let mut last = u32::MAX;
-                for (s, &(column, _)) in layout.snps.iter().enumerate() {
-                    if column != last {
-                        last = column;
-                        let g = snp_group[s] as usize;
-                        cells += (matches!(row[column as usize], b'A' | b'C' | b'G' | b'T')
-                            && positions[g] != NO_POSITION)
-                            as usize;
-                    }
-                }
-                let mut snps: Vec<(u32, u32, f64)> = Vec::new();
-                for c in 0..layout.n_clusters {
-                    snps.clear();
-                    for &(column, g, weight) in
-                        &by_cluster[cluster_bounds[c]..cluster_bounds[c + 1]]
-                    {
-                        if matches!(row[column as usize], b'A' | b'C' | b'G' | b'T') {
-                            let pos = positions[g as usize];
-                            if pos != NO_POSITION {
-                                snps.push((pos, column, weight));
-                            }
-                        }
-                    }
-                    if genome == 0 || snps.len() < 2 {
-                        continue;
-                    }
-                    snps.sort_unstable_by_key(|s| (s.0, s.1));
-                    scan_cluster(
-                        &mut snps,
-                        contig_ends,
-                        window,
-                        p,
-                        threshold,
-                        &mut critical,
-                        &mut masked,
-                    );
-                }
-                // A SNP split between clusters is masked if flagged in any of them.
-                masked.sort_unstable();
-                masked.dedup();
+                let (cells, masked) = flag_isolate(
+                    isolate,
+                    row,
+                    layout,
+                    &snp_groups,
+                    &cluster_snps,
+                    window,
+                    alpha,
+                );
                 let original = if keep_original_bases {
                     masked.iter().map(|&c| (c, row[c as usize])).collect()
                 } else {
@@ -417,27 +625,28 @@ pub(crate) fn mask_recombinant_snps(
                 };
                 for &column in &masked {
                     row[column as usize] = b'N';
+                    column_masked[column as usize / 64].fetch_or(1 << (column % 64), Relaxed);
                 }
-                (cells, masked, original)
+                (cells, masked.len(), original)
             })
             .collect()
     });
 
     let mut stats = RecombinationStats::default();
-    let mut column_masked = vec![false; rows.first().map_or(0, Vec::len)];
     for (cells, masked, original) in per_isolate {
         if keep_original_bases {
             stats.original_bases.push(original);
         }
         stats.cells += cells;
-        stats.masked_cells += masked.len();
-        stats.isolates += !masked.is_empty() as usize;
-        for column in masked {
-            column_masked[column as usize] = true;
-        }
+        stats.masked_cells += masked;
+        stats.isolates += (masked > 0) as usize;
     }
-    stats.masked_columns = (0..column_masked.len() as u32)
-        .filter(|&c| column_masked[c as usize])
+    let column_masked: Vec<u64> = column_masked
+        .into_iter()
+        .map(AtomicU64::into_inner)
+        .collect();
+    stats.masked_columns = (0..n_columns as u32)
+        .filter(|&c| column_masked[c as usize / 64] >> (c % 64) & 1 == 1)
         .collect();
     Ok(stats)
 }
@@ -497,6 +706,31 @@ mod tests {
             .sum()
     }
 
+    /// Scan one cluster given as (position, column, weight) sorted by position; returns
+    /// the flagged columns, sorted, and the number of SNPs left.
+    fn scan(
+        snps: &[(u32, u32, f64)],
+        contig_ends: &[u32],
+        window: u32,
+        p: f64,
+        threshold: f64,
+    ) -> (Vec<u32>, usize) {
+        let mut snps = place(snps.iter().copied(), contig_ends, window);
+        let mut masked = Vec::new();
+        let mut known = HashMap::new();
+        let mut scratch = Scratch::default();
+        scan_cluster(
+            &mut snps,
+            p,
+            threshold,
+            &mut known,
+            &mut scratch,
+            &mut masked,
+        );
+        masked.sort_unstable();
+        (masked, snps.len())
+    }
+
     #[test]
     fn critical_count_matches_exact_binomial_tail() {
         for &k in &[2u32, 3, 5, 20, 100, 1000, 5000] {
@@ -531,21 +765,11 @@ mod tests {
         snps.sort_unstable_by_key(|s| (s.0, s.1));
         let p = window as f64 / genome as f64;
         let threshold = DEFAULT_ALPHA / (genome as f64 / window as f64);
-        let mut masked = Vec::new();
-        scan_cluster(
-            &mut snps,
-            &[genome],
-            window,
-            p,
-            threshold,
-            &mut HashMap::new(),
-            &mut masked,
-        );
-        masked.sort_unstable();
+        let (masked, left) = scan(&snps, &[genome], window, p, threshold);
         // The 8 concentrated SNPs (and possibly the evenly spaced one at 501 kb).
         assert!((100..108).all(|c| masked.contains(&c)), "{masked:?}");
         assert!(masked.len() <= 9);
-        assert_eq!(snps.len() + masked.len(), 48);
+        assert_eq!(left + masked.len(), 48);
     }
 
     #[test]
@@ -569,10 +793,10 @@ mod tests {
             positions.push(scattered);
         }
         let mut rows = vec![vec![b'A'; 26], vec![b'C'; 26]];
-        let weights = vec![1.0; snps.len()];
+        // Pattern 0 is cluster 0, pattern 1 cluster 1.
         let layout = SnpLayout {
             snps: &snps,
-            weights: &weights,
+            pattern_clusters: &[vec![0], vec![1]],
             n_clusters: 2,
             group_ends: &group_ends,
             positions: &positions,
@@ -620,19 +844,8 @@ mod tests {
         let p = window as f64 / genome as f64;
         let threshold = DEFAULT_ALPHA / (genome as f64 / window as f64);
         let run = |cluster: &[(u32, u32)], ends: &[u32]| {
-            let mut snps: Vec<(u32, u32, f64)> =
-                cluster.iter().map(|&(p, c)| (p, c, 1.0)).collect();
-            let mut masked = Vec::new();
-            scan_cluster(
-                &mut snps,
-                ends,
-                window,
-                p,
-                threshold,
-                &mut HashMap::new(),
-                &mut masked,
-            );
-            masked.len()
+            let snps: Vec<(u32, u32, f64)> = cluster.iter().map(|&(p, c)| (p, c, 1.0)).collect();
+            scan(&snps, ends, window, p, threshold).0.len()
         };
         // K = 4 SNPs: 3 are needed in a window. Two at 498-499 kb, two at 501-502 kb.
         let split: Vec<(u32, u32)> = [498_000, 499_000, 501_000, 502_000]
@@ -692,10 +905,9 @@ mod tests {
         let snps = vec![(0u32, 0u32), (1, 0), (2, 0)];
         let positions = vec![100u32, 200, 300];
         let mut rows = vec![b"N-A".to_vec()];
-        let weights = vec![1.0; snps.len()];
         let layout = SnpLayout {
             snps: &snps,
-            weights: &weights,
+            pattern_clusters: &[vec![0]],
             n_clusters: 1,
             group_ends: &[1, 2, 3],
             positions: &positions,
@@ -727,38 +939,117 @@ mod tests {
     }
 
     #[test]
-    fn quick_exit_agrees_with_the_bisection() {
-        // Whatever the weight of the heaviest window, including weights right at the
-        // critical weight, windows are significant in the same cases as when the
-        // critical weight is always computed.
+    fn lazy_bisection_agrees_with_the_complete_bisection() {
+        // Windows are significant in the same cases as with the critical weight of the
+        // complete bisection, including weights right at it, in any order.
         for &k in &[2.0, 2.5, 3.0, 7.25, 20.0, 100.0, 1000.5] {
             for &p in &[0.0001, 0.001, 0.009, 0.05, 0.3, 1.0] {
                 for &threshold in &[0.05, 1e-3, 1e-6] {
                     let full = critical_weight(k, p, threshold);
+                    let Some(mut lazy) = CriticalWeight::new(k, p, threshold) else {
+                        assert_eq!(full, None);
+                        continue;
+                    };
+                    let c = full.unwrap();
                     let mut weights: Vec<f64> = (0..=40).map(|i| k * i as f64 / 40.0).collect();
-                    if let Some(c) = full {
-                        for d in [
-                            0.0, 1e-12, 1e-10, 9e-10, 1e-9, 1.1e-9, 3e-9, 1e-7, 1e-6, 2e-6, 1e-4,
-                        ] {
-                            weights.extend([c - d, c + d]);
-                        }
+                    for d in [
+                        0.0, 1e-12, 1e-10, 9e-10, 1e-9, 1.1e-9, 3e-9, 1e-7, 1e-6, 2e-6, 1e-4,
+                    ] {
+                        weights.extend([c - d, c + d]);
                     }
-                    for w in weights {
-                        let quick =
-                            critical_weight_if_reached(k, w, p, threshold, &mut HashMap::new());
-                        let significant = |c: Option<f64>| c.is_some_and(|c| w >= c - TOLERANCE);
-                        assert_eq!(significant(quick), significant(full), "k={k} p={p} w={w}");
-                        assert!(quick.is_none() || quick == full);
+                    for i in 0..weights.len() {
+                        // Alternately from either end.
+                        let w = weights[if i % 2 == 0 {
+                            i / 2
+                        } else {
+                            weights.len() - 1 - i / 2
+                        }];
+                        assert_eq!(lazy.reached_by(w), w >= c - TOLERANCE, "k={k} p={p} w={w}");
                     }
                 }
             }
         }
-        // A known critical weight is returned as is.
-        let mut known = HashMap::from([(3.0f64.to_bits(), Some(1.5))]);
-        assert_eq!(
-            critical_weight_if_reached(3.0, 0.0, 0.01, 0.05, &mut known),
-            Some(1.5)
-        );
+    }
+
+    /// The scan of one cluster without shortcuts: every window of every round is
+    /// compared with the critical weight of the complete bisection.
+    fn scan_directly(snps: &[Snp], p: f64, threshold: f64) -> Vec<u32> {
+        let mut snps = snps.to_vec();
+        let mut masked = Vec::new();
+        loop {
+            let mut prefix = vec![0.0];
+            for snp in &snps {
+                prefix.push(prefix[prefix.len() - 1] + snp.weight);
+            }
+            let Some(c) = critical_weight(prefix[snps.len()], p, threshold) else {
+                break;
+            };
+            let mut flagged = vec![false; snps.len()];
+            for_each_window(&snps, |start, end| {
+                if prefix[end] - prefix[start] >= c - TOLERANCE {
+                    flagged[start..end].fill(true);
+                }
+            });
+            if !flagged.contains(&true) {
+                break;
+            }
+            masked.extend(
+                (0..snps.len())
+                    .filter(|&i| flagged[i])
+                    .map(|i| snps[i].column),
+            );
+            let mut i = 0;
+            snps.retain(|_| {
+                i += 1;
+                !flagged[i - 1]
+            });
+        }
+        masked.sort_unstable();
+        masked
+    }
+
+    #[test]
+    fn shortcuts_give_the_direct_results() {
+        let mut state = 11u64;
+        let mut next = move |m: u64| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) % m
+        };
+        // 1 Mb genome in three contigs, 10 kb windows.
+        let (genome, window, ends) = (1_000_000, 10_000, [300_000, 310_000, 1_000_000]);
+        let p = window as f64 / genome as f64;
+        let mut flagged_clusters = 0;
+        for trial in 0..3000 {
+            let threshold = [0.05, 1e-3, 1e-6][trial % 3] / (genome as f64 / window as f64);
+            // Scattered SNPs and a few denser stretches, whole or split.
+            let mut snps: Vec<(u32, u32, f64)> = Vec::new();
+            for i in 0..2 + next(60) as u32 {
+                let pos = if next(3) == 0 {
+                    290_000 + next(30_000) as u32
+                } else {
+                    next(genome as u64) as u32
+                };
+                snps.push((pos, i, 1.0 / (1 + next(4) * next(3)) as f64));
+            }
+            snps.sort_unstable_by_key(|s| (s.0, s.1));
+            let placed = place(snps.iter().copied(), &ends, window);
+            let direct = scan_directly(&placed, p, threshold);
+            assert_eq!(
+                scan(&snps, &ends, window, p, threshold).0,
+                direct,
+                "{trial}"
+            );
+            flagged_clusters += !direct.is_empty() as usize;
+            // The bound rules out only clusters without significant windows.
+            let mut bound = WindowBound::new(genome, window);
+            for &(pos, _, w) in &snps {
+                bound.add(bound.bin(pos), w as f32);
+            }
+            assert!(bound.may_be_significant(p, threshold) || direct.is_empty());
+        }
+        assert!(flagged_clusters > 300, "{flagged_clusters}");
     }
 
     #[test]
@@ -770,36 +1061,18 @@ mod tests {
         let threshold = DEFAULT_ALPHA / (genome as f64 / window as f64);
         let x = critical_weight(3.0, p, threshold).unwrap();
         assert!(x > 1.0 && x <= 2.0, "{x}");
-        let mut snps = vec![
+        let snps = [
             (1_000, 0, 1.0),
             (2_000, 1, 0.5),
             (3_000, 2, 0.5),
             (900_000, 3, 1.0),
         ];
-        let mut masked = Vec::new();
-        scan_cluster(
-            &mut snps,
-            &[genome],
-            window,
-            p,
-            threshold,
-            &mut HashMap::new(),
-            &mut masked,
+        assert_eq!(
+            scan(&snps, &[genome], window, p, threshold).0,
+            vec![0, 1, 2]
         );
-        masked.sort_unstable();
-        assert_eq!(masked, vec![0, 1, 2]);
         // A single SNP is never significant on its own, whatever its weight.
-        let mut lone = vec![(1_000, 0, 1.0), (900_000, 1, 1.0)];
-        let mut masked = Vec::new();
-        scan_cluster(
-            &mut lone,
-            &[genome],
-            window,
-            p,
-            threshold,
-            &mut HashMap::new(),
-            &mut masked,
-        );
-        assert!(masked.is_empty());
+        let lone = [(1_000, 0, 1.0), (900_000, 1, 1.0)];
+        assert!(scan(&lone, &[genome], window, p, threshold).0.is_empty());
     }
 }
