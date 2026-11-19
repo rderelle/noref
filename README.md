@@ -51,15 +51,11 @@ This dataset corresponds to the Euro-GASP 2020 study published by [Golparian et 
 ![noref result for the pneumo dataset](images/neisseria.png)
 
 ## input
-[TBC] bacterial genome assemblies in a directory with `-i`, or paths of input files provided in a headerless tab-delimited file using the `-I` argument (see [here](https://github.com/rderelle/kamino#input) for more details).
+Bacterial genome assemblies in a directory with `-i`, or paths of input files provided in a headerless tab-delimited file using the `-I` argument (see [here](https://github.com/rderelle/kamino#input) for more details).
 
 ## output
-[TBC] SNP alignments (with some constant positions; not a pseudo-alignment of genomes), midpoint rooted NJ trees with `--nj`, and a recombination gff file for [Phandango](https://github.com/jameshadfield/phandango) with `-p`/`--plot`.
-For the latter, the name of the isolate whose genome the recombinant SNPs will be mapped onto should be indicated.
-
-
-## Documentation
-[TBC]
+SNP alignments (with some constant positions; not a pseudo-alignment of genomes), midpoint rooted NJ trees with `--nj`, and a recombination gff file for [Phandango](https://github.com/jameshadfield/phandango) with `-p`/`--plot`.
+For the latter, the name of the input isolate whose genome the recombinant SNPs will be mapped onto should be indicated.
 
 ---
 This codebase is provided under the MIT License. The code was drafted using AI assistance.
