@@ -39,6 +39,16 @@ impl IsolateMask {
     }
 
     #[inline]
+    fn contains(&self, isolate: usize) -> bool {
+        let word = match self {
+            Self::Inline(mask) => *mask,
+            Self::Inline512(words) => words[isolate >> 6],
+            Self::Dynamic(words) => words[isolate >> 6],
+        };
+        word >> (isolate & 63) & 1 == 1
+    }
+
+    #[inline]
     fn count(&self) -> usize {
         match self {
             Self::Inline(mask) => mask.count_ones() as usize,
@@ -122,14 +132,15 @@ fn select_unique_best_supported_length(
     // Isolates with the anchor pair at several genome positions (whatever the middle
     // length) may hold paralogs: their occurrences are dropped, so the group is
     // missing data for them. Sequences are kept for the overlap filtering.
-    let mut isolates: Vec<u16> = group.occurrences.iter().map(|o| o.isolate).collect();
-    isolates.sort_unstable();
-    let mut multi_copy: Vec<u16> = isolates
-        .windows(2)
-        .filter(|w| w[0] == w[1])
-        .map(|w| w[0])
-        .collect();
-    multi_copy.dedup();
+    let mut seen = IsolateMask::new(n_isolates);
+    let mut multi_copy = IsolateMask::new(n_isolates);
+    for occurrence in &group.occurrences {
+        let isolate = occurrence.isolate as usize;
+        if seen.contains(isolate) {
+            multi_copy.insert(isolate);
+        }
+        seen.insert(isolate);
+    }
 
     let mut remap = vec![u16::MAX; group.sequences.len()];
     let mut sequences = Vec::with_capacity(group.sequences.len());
@@ -143,7 +154,7 @@ fn select_unique_best_supported_length(
     group.sequences = sequences;
     group.occurrences.retain_mut(|occurrence| {
         let new_id = remap[occurrence.sequence_id as usize];
-        if new_id == u16::MAX || multi_copy.binary_search(&occurrence.isolate).is_ok() {
+        if new_id == u16::MAX || multi_copy.contains(occurrence.isolate as usize) {
             false
         } else {
             occurrence.sequence_id = new_id;
@@ -216,29 +227,6 @@ fn retain_nonoverlapping_groups(
     groups
 }
 
-/// One row per isolate: the isolate's middle sequence, or `-` (missing) when it has
-/// no occurrence. After length filtering, an isolate has at most one occurrence.
-pub(crate) fn rows_by_isolate(
-    group: &RawGroup,
-    arena: &BlockArena,
-    n_isolates: usize,
-    len: usize,
-) -> Vec<Vec<u8>> {
-    let mut rows = vec![vec![b'-'; len]; n_isolates];
-    for occurrence in &group.occurrences {
-        let block = group.sequences[occurrence.sequence_id as usize];
-        let row = &mut rows[occurrence.isolate as usize];
-        debug_assert!(
-            row.iter().all(|&b| b == b'-'),
-            "isolate with two occurrences"
-        );
-        for (cell, base) in row.iter_mut().zip(arena.bases(block)).take(len) {
-            *cell = base;
-        }
-    }
-    rows
-}
-
 pub(crate) struct SortedGroups {
     /// Isolate names in deterministic row order.
     pub(crate) isolate_names: Vec<String>,
@@ -297,6 +285,29 @@ mod tests {
     use super::*;
     use crate::dna::{encode, pack, revcomp};
     use crate::group_extraction::BlockOccurrence;
+
+    /// One row per isolate: the isolate's middle sequence, or `-` (missing) when it has
+    /// no occurrence. After length filtering, an isolate has at most one occurrence.
+    fn rows_by_isolate(
+        group: &RawGroup,
+        arena: &BlockArena,
+        n_isolates: usize,
+        len: usize,
+    ) -> Vec<Vec<u8>> {
+        let mut rows = vec![vec![b'-'; len]; n_isolates];
+        for occurrence in &group.occurrences {
+            let block = group.sequences[occurrence.sequence_id as usize];
+            let row = &mut rows[occurrence.isolate as usize];
+            debug_assert!(
+                row.iter().all(|&b| b == b'-'),
+                "isolate with two occurrences"
+            );
+            for (cell, base) in row.iter_mut().zip(arena.bases(block)).take(len) {
+                *cell = base;
+            }
+        }
+        rows
+    }
 
     fn group(arena: &mut BlockArena, rows: &[(u16, &[u8])]) -> RawGroup {
         let mut group = RawGroup::default();
@@ -468,6 +479,7 @@ mod tests {
                 mask.insert(isolate);
             }
             assert_eq!(mask.count(), 3);
+            assert!(mask.contains(n - 1) && mask.contains(1) && !mask.contains(2));
         }
     }
 
