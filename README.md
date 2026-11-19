@@ -1,4 +1,7 @@
-<h1 align="center">noref</h1>
+<p align="center">
+  <img src="images/noref_logo.svg" alt="noref" width="360">
+</p>
+
 
 noref ('no reference' genome needed) is designed for within-species phylogenetic analyses (population genomics) from genome assemblies, in a fast and easy way. It is only recommended for bacterial species and only accepts genome assemblies as input (not sequencing reads).
 
