@@ -1,6 +1,7 @@
 [![Cargo Build & Test](https://github.com/rderelle/noref/actions/workflows/ci.yml/badge.svg)](https://github.com/rderelle/noref/actions/workflows/ci.yml)
 [![Clippy check](https://github.com/rderelle/noref/actions/workflows/clippy.yml/badge.svg)](https://github.com/rderelle/noref/actions/workflows/clippy.yml)
 [![codecov](https://codecov.io/github/rderelle/noref/graph/badge.svg?token=6B8WIGZL2F)](https://codecov.io/github/rderelle/noref)
+[![install with bioconda](https://img.shields.io/badge/install%20with-bioconda-brightgreen.svg?style=flat)](https://bioconda.github.io/recipes/noref/README.html)
 
 <p align="center">
   <img src="images/noref_logo.svg" alt="noref" width="360">
@@ -20,6 +21,11 @@ Please note that this tool is still under development.
 - detection of recombination: SNPs are first clustered by isolate profile. Then each input assembly is scanned for local enrichment of each SNP cluster independently, using a window scan and a binomial test (p-value threshold with Bonferroni correction): SNPs in significant windows are masked in the corresponding isolate.
 
 ## installation
+```bash
+conda install bioconda::noref
+```
+or from source:
+
 ```bash
 git clone https://github.com/rderelle/noref.git
 cd noref
