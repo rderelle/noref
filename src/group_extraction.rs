@@ -26,11 +26,9 @@ use seq_io::fasta::{Reader as FastaReader, Record};
 use std::io::{self, IsTerminal, Write};
 use std::sync::Mutex;
 
-use crate::dna::{encode, normalize, Roller, INVALID};
+use crate::dna::{encode, normalize, revcomp_code, Roller, INVALID};
 use crate::io::{open_fasta, IsolateInput};
-use crate::proba_filter::{
-    AtomicCountMinSketch, BloomFilter, CountMinSketch, BATCH, BLOOM_BITS, CMS_LINES,
-};
+use crate::proba_filter::{BloomFilter, CountMinSketch, BATCH, BLOOM_BITS, CMS_LINES};
 use crate::run_log::{say, RunLog};
 
 const START_CLUSTER_SPAN: u32 = 10;
@@ -88,8 +86,13 @@ impl Progress {
     }
 }
 
-/// Handle to one sequence stored in a [`BlockArena`]: base offset (48 bits) and
-/// length (16 bits) packed into 8 bytes.
+/// Sequences of up to this many bases are held by their [`Block`] itself.
+const INLINE_BASES: usize = 24;
+
+/// Handle to one sequence of a [`BlockArena`], in 8 bytes: length (16 bits) and,
+/// above it, the base offset of the sequence in the arena or, for sequences of at
+/// most [`INLINE_BASES`] bases (the most common), the bases themselves. Short
+/// sequences thus take no arena space, and are equal if their blocks are.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Block(u64);
 
@@ -100,14 +103,25 @@ impl Block {
     }
 
     #[inline]
+    fn is_inline(self) -> bool {
+        self.len() <= INLINE_BASES
+    }
+
+    /// Offset of a sequence stored in the arena.
+    #[inline]
     fn start(self) -> usize {
+        debug_assert!(!self.is_inline());
         (self.0 >> 16) as usize
     }
 
     /// The same sequence, `bases` further in the arena (see [`BlockArena::append`]).
     #[inline]
     fn shifted(self, bases: usize) -> Self {
-        Self(self.0 + ((bases as u64) << 16))
+        if self.is_inline() {
+            self
+        } else {
+            Self(self.0 + ((bases as u64) << 16))
+        }
     }
 }
 
@@ -127,15 +141,21 @@ impl BlockArena {
     /// Append base codes (0..=3) as one sequence.
     fn push_codes(&mut self, codes: impl Iterator<Item = u8>) -> Result<Block> {
         let start = self.len;
+        // Bases are packed in a word first, appended every 32 bases.
+        let (mut bits, mut n) = (0u64, 0);
         for code in codes {
             debug_assert!(code < 4);
-            let shift = 2 * (self.len % 32);
-            if shift == 0 {
-                self.words.push(0);
+            bits |= (code as u64) << (2 * n);
+            n += 1;
+            if n == 32 {
+                self.push_chunk(bits, n);
+                (bits, n) = (0, 0);
             }
-            *self.words.last_mut().unwrap() |= (code as u64) << shift;
-            self.len += 1;
         }
+        if self.len == start && n <= INLINE_BASES {
+            return Ok(Block((bits << 16) | n as u64));
+        }
+        self.push_chunk(bits, n);
         let len = self.len - start;
         if len > u16::MAX as usize {
             bail!("block length {len} exceeds u16::MAX");
@@ -162,9 +182,34 @@ impl BlockArena {
         shift
     }
 
+    /// Append `n <= 32` bases packed in `bits` as by [`Self::chunk`] (higher bits zero).
+    #[inline]
+    fn push_chunk(&mut self, bits: u64, n: usize) {
+        let shift = 2 * (self.len % 32);
+        if shift == 0 {
+            if n > 0 {
+                self.words.push(bits);
+            }
+        } else {
+            *self.words.last_mut().unwrap() |= bits << shift;
+            if shift + 2 * n > 64 {
+                self.words.push(bits >> (64 - shift));
+            }
+        }
+        self.len += n;
+    }
+
     /// Copy a sequence from another arena.
     fn copy_from(&mut self, other: &BlockArena, block: Block) -> Result<Block> {
-        self.push_codes(other.codes(block))
+        if block.is_inline() {
+            return Ok(block);
+        }
+        let start = self.len;
+        for i in (0..block.len()).step_by(32) {
+            let n = (block.len() - i).min(32);
+            self.push_chunk(other.chunk(block.start() + i, n), n);
+        }
+        Ok(Block(((start as u64) << 16) | block.len() as u64))
     }
 
     #[inline]
@@ -172,17 +217,23 @@ impl BlockArena {
         ((self.words[i / 32] >> (2 * (i % 32))) & 3) as u8
     }
 
-    /// Base codes (0..=3) of a stored sequence.
+    /// Base codes (0..=3) of a sequence.
     pub(crate) fn codes(&self, block: Block) -> impl Iterator<Item = u8> + '_ {
-        (block.start()..block.start() + block.len()).map(|i| self.code(i))
+        (0..block.len()).map(move |i| {
+            if block.is_inline() {
+                ((block.0 >> (16 + 2 * i)) & 3) as u8
+            } else {
+                self.code(block.start() + i)
+            }
+        })
     }
 
-    /// Uppercase bases of a stored sequence.
+    /// Uppercase bases of a sequence.
     pub(crate) fn bases(&self, block: Block) -> impl Iterator<Item = u8> + '_ {
         self.codes(block).map(|code| b"ACGT"[code as usize])
     }
 
-    /// Decoded copy of a stored sequence (tests only).
+    /// Decoded copy of a sequence (tests only).
     #[cfg(test)]
     pub(crate) fn get(&self, block: Block) -> Vec<u8> {
         self.bases(block).collect()
@@ -204,6 +255,9 @@ impl BlockArena {
 
     /// Whether `a` (in `self`) and `b` (in `other`) hold the same sequence.
     fn same(&self, a: Block, other: &BlockArena, b: Block) -> bool {
+        if a.is_inline() || b.is_inline() {
+            return a == b;
+        }
         a.len() == b.len()
             && (0..a.len()).step_by(32).all(|i| {
                 let n = (a.len() - i).min(32);
@@ -426,11 +480,10 @@ fn find_segment_anchor_pairs(seg: &[u8], ctx: &SegmentContext, s: &mut Scratch) 
 
 /// Forward and reverse-complement codes of an ACGT-only k-mer.
 fn kmer_codes(kmer: &[u8]) -> (u64, u64) {
-    let mut roller = Roller::new(kmer.len());
-    for &b in kmer {
-        roller.push(encode(b));
-    }
-    (roller.fwd, roller.rc)
+    let fwd = kmer
+        .iter()
+        .fold(0, |code, &b| (code << 2) | encode(b) as u64);
+    (fwd, revcomp_code(fwd, kmer.len()))
 }
 
 /// Extract the occurrences of one ACGT-only segment starting at genome coordinate `offset`.
@@ -691,33 +744,24 @@ pub(crate) fn extract_groups(
     let n_threads = num_threads.max(1);
     let pool = ThreadPoolBuilder::new().num_threads(n_threads).build()?;
 
-    // Pass 1: count genome occupancies. A single worker uses plain counters;
-    // concurrent workers share atomic counters until counting is complete.
+    // Pass 1: count genome occupancies. Threads add k-mers to the sketch region by
+    // region (see `SharedSketch`), so the counts do not depend on the number of threads.
     say!(log, " . pass 1: estimate k-mer occupancies");
     let progress = Progress::new(n);
-    let cms = if n_threads == 1 {
-        let mut cms = CountMinSketch::new(CMS_LINES);
-        let result = inputs.iter().try_for_each(|input| {
-            count_isolate_kmers(input, k, |keys| cms.increment_batch(keys))?;
+    let mut cms = CountMinSketch::new(CMS_LINES);
+    let shared = cms.shared();
+    let result = pool.install(|| {
+        inputs.par_iter().try_for_each(|input| {
+            let mut writer = shared.writer();
+            count_isolate_kmers(input, k, |keys| writer.add(keys))?;
+            writer.finish();
             progress.increment();
             Ok::<_, anyhow::Error>(())
-        });
-        progress.finish();
-        result?;
-        cms
-    } else {
-        let cms = AtomicCountMinSketch::new(CMS_LINES);
-        let result = pool.install(|| {
-            inputs.par_iter().try_for_each(|input| {
-                count_isolate_kmers(input, k, |keys| cms.increment_batch(keys))?;
-                progress.increment();
-                Ok::<_, anyhow::Error>(())
-            })
-        });
-        progress.finish();
-        result?;
-        cms.into_snapshot()
-    };
+        })
+    });
+    drop(shared);
+    progress.finish();
+    result?;
 
     // Pass 2: each thread extracts the occurrences of a genome, then merges them into
     // the group tables, one table at a time.
@@ -810,7 +854,7 @@ mod tests {
             })
             .collect();
         let (mut a, mut b) = (BlockArena::new(), BlockArena::new());
-        b.push(b"ACG").unwrap(); // shift every block of `b`
+        b.push(&[b'C'; 37]).unwrap(); // shift every stored block of `b`
         let blocks_a: Vec<Block> = seqs.iter().map(|s| a.push(s).unwrap()).collect();
         let blocks_b: Vec<Block> = seqs.iter().map(|s| b.push(s).unwrap()).collect();
         for (i, &x) in blocks_a.iter().enumerate() {
@@ -820,9 +864,25 @@ mod tests {
             }
         }
         let mut c = BlockArena::new();
-        let copied = c.copy_from(&a, blocks_a[7]).unwrap();
-        assert!(c.same(copied, &a, blocks_a[7]));
+        for (i, &x) in blocks_a.iter().enumerate() {
+            let copied = c.copy_from(&a, x).unwrap();
+            assert!(c.same(copied, &a, x));
+            assert_eq!(c.get(copied), seqs[i]);
+        }
         assert!(a.push(&vec![b'A'; 65536]).is_err());
+    }
+
+    #[test]
+    fn short_sequences_take_no_arena_space() {
+        let mut arena = BlockArena::new();
+        let short = arena.push(&[b'T'; INLINE_BASES]).unwrap();
+        let empty = arena.push(b"").unwrap();
+        assert_eq!(arena.len, 0);
+        let long = arena.push(&[b'T'; INLINE_BASES + 1]).unwrap();
+        assert_eq!(arena.len, INLINE_BASES + 1);
+        assert_eq!(arena.get(short), [b'T'; INLINE_BASES]);
+        assert_eq!((arena.get(empty), short.shifted(9)), (vec![], short));
+        assert_eq!(arena.get(long), [b'T'; INLINE_BASES + 1]);
     }
 
     #[test]
@@ -950,14 +1010,19 @@ mod tests {
     #[test]
     fn merge_interns_sequences_and_keeps_locations() {
         let key = (3, 5);
+        // Long enough to be stored in the arena (see `INLINE_BASES`).
+        let (acg, act) = (
+            &[b"ACG" as &[u8]; 10].concat(),
+            &[b"ACT" as &[u8]; 10].concat(),
+        );
         let mut merger = Merger::new(3, 1);
-        merge(&mut merger, 0, &[(key, 10, b"ACG"), (key, 11, b"ACG")]);
-        merge(&mut merger, 1, &[(key, 20, b"ACT")]);
-        merge(&mut merger, 2, &[(key, 30, b"ACG")]);
+        merge(&mut merger, 0, &[(key, 10, acg), (key, 11, acg)]);
+        merge(&mut merger, 1, &[(key, 20, act)]);
+        merge(&mut merger, 2, &[(key, 30, acg)]);
         let group = &merger.groups[&key];
         assert_eq!(group.sequences.len(), 2);
         assert_eq!(group.n_isolates, 3);
-        assert_eq!(merger.arena.len, 6);
+        assert_eq!(merger.arena.len, 60);
         assert_eq!(
             group
                 .occurrences
@@ -971,13 +1036,14 @@ mod tests {
     #[test]
     fn appended_arenas_keep_their_sequences() {
         let (mut a, mut b) = (BlockArena::new(), BlockArena::new());
-        let first = a.push(b"ACGTACGTA").unwrap();
-        // More than one word, so that `b` holds a partial last word too.
+        // More than one word, so that the arenas hold a partial last word.
+        let first_seq: Vec<u8> = b"ACGTACGTA".iter().cycle().take(40).copied().collect();
+        let first = a.push(&first_seq).unwrap();
         let long: Vec<u8> = b"GATTACA".iter().cycle().take(45).copied().collect();
         let blocks = [b.push(b"TTG").unwrap(), b.push(&long).unwrap()];
         let shift = a.append(&b);
-        assert_eq!(shift, 32);
-        assert_eq!(a.get(first), b"ACGTACGTA");
+        assert_eq!(shift, 64);
+        assert_eq!(a.get(first), first_seq);
         assert_eq!(a.get(blocks[0].shifted(shift)), b"TTG");
         assert_eq!(a.get(blocks[1].shifted(shift)), long);
         // The arena can still grow, and be appended to an empty one.

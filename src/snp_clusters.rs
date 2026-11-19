@@ -27,14 +27,11 @@
 //!    Representatives never change, so the order only decides which profiles become
 //!    representatives. No SNP is discarded.
 //!
-//! Finding the agreeing representatives is exact, by one of two equivalent methods
-//! chosen per pattern by cost: a profile with `u` missing isolates stands for `2^u`
-//! complete profiles (each missing isolate filled with either base), and two profiles
-//! agree exactly when they share one of these completions. Representatives never agree
-//! with each other, so their completions are disjoint and can be kept in a hash map:
-//! a pattern is placed with `2^u` lookups, or, when `2^u` exceeds the number of
-//! clusters, by comparing it with every representative. Both methods return the same
-//! clusters, so the choice only affects speed.
+//! Finding the agreeing representatives is exact: every representative is compared
+//! with the pattern. Representatives are stored isolate by isolate, 64 per word (see
+//! [`Representatives`]), so that a pattern is compared with 64 representatives at a
+//! time, until all 64 disagree. Patterns are compared with the representatives in
+//! parallel, by batches (see [`cluster_patterns`]).
 use hashbrown::HashMap;
 use rayon::prelude::*;
 
@@ -47,9 +44,9 @@ const CHUNK: usize = 256;
 /// bounds the memory used by per-SNP bitsets.
 const CHUNKS_PER_BATCH: usize = 64;
 
-/// Founders with more missing isolates than this are compared directly instead of
-/// having their `2^u` completions indexed. Affects memory and speed, not results.
-const MAX_INDEXED_MISSING: usize = 10;
+/// Patterns compared in parallel with the cluster representatives (see
+/// [`cluster_patterns`]). Affects speed, not results.
+const BATCH: usize = 1024;
 
 /// One bit per isolate.
 type Bits = Box<[u64]>;
@@ -68,11 +65,11 @@ pub(crate) struct SnpStats {
 
 /// Result of step 1: the cluster(s) of each SNP, for the next step.
 pub(crate) struct SnpClusters {
-    /// Alignment column and cluster of each SNP membership, in column order: a SNP
-    /// split between several clusters appears once per cluster.
+    /// Alignment column and pattern of each SNP, in column order.
     pub(crate) snps: Vec<(u32, u32)>,
-    /// Weight of each entry of `snps`: `1/n` for a SNP split between `n` clusters.
-    pub(crate) weights: Vec<f64>,
+    /// Clusters of each pattern, in ascending order: a SNP split between `n` clusters
+    /// counts `1/n` in each.
+    pub(crate) pattern_clusters: Vec<Vec<u32>>,
     pub(crate) stats: SnpStats,
 }
 
@@ -89,8 +86,8 @@ struct ColumnSnp {
 struct Pattern {
     present: Bits,
     profile: Bits,
-    /// Isolates without data.
-    missing: Vec<u32>,
+    /// Number of isolates without data.
+    missing: usize,
     /// Number of SNPs.
     weight: u64,
     /// Column of the first SNP (for a deterministic order).
@@ -209,27 +206,86 @@ fn agree(present_a: &[u64], a: &[u64], present_b: &[u64], b: &[u64]) -> bool {
     same || complement
 }
 
-/// Calls `f` with each canonical completion of `pattern` (each missing isolate set to
-/// either base, then oriented so that isolate 0 is excluded).
-fn for_each_completion(pattern: &Pattern, full: &[u64], mut f: impl FnMut(&[u64])) {
-    let mut key: Vec<u64> = pattern.profile.to_vec();
-    let mut canonical = vec![0u64; key.len()];
-    let u = pattern.missing.len();
-    for gray in 0u64..1 << u {
-        if gray > 0 {
-            // Gray code: consecutive completions differ by one isolate.
-            let i = pattern.missing[gray.trailing_zeros() as usize] as usize;
-            key[i / 64] ^= 1 << (i % 64);
-        }
-        if key[0] & 1 == 1 {
-            for ((c, &k), &m) in canonical.iter_mut().zip(&key).zip(full) {
-                *c = m & !k;
-            }
-            f(&canonical);
-        } else {
-            f(&key);
+/// Cluster representatives, stored isolate by isolate in blocks of 64: in block `b`,
+/// bit `j` of word `i` is set when representative `64 b + j` has data in isolate `i`
+/// and its profile includes it, and bit `j` of word `n + i` when it has data in
+/// isolate `i` and its profile excludes it.
+struct Representatives {
+    n: usize,
+    len: usize,
+    blocks: Vec<u64>,
+}
+
+impl Representatives {
+    fn new(n: usize) -> Self {
+        Self {
+            n,
+            len: 0,
+            blocks: Vec::new(),
         }
     }
+
+    fn push(&mut self, pattern: &Pattern) {
+        if self.len.is_multiple_of(64) {
+            self.blocks.resize(self.blocks.len() + 2 * self.n, 0);
+        }
+        let block = self.blocks.len() - 2 * self.n;
+        for i in (0..self.n).filter(|&i| is_set(&pattern.present, i)) {
+            let word = if is_set(&pattern.profile, i) {
+                i
+            } else {
+                self.n + i
+            };
+            self.blocks[block + word] |= 1 << (self.len % 64);
+        }
+        self.len += 1;
+    }
+
+    /// Appends to `hits`, in ascending order, the representatives that agree with a
+    /// pattern described by `checks` (see [`checks`]).
+    fn agreeing(&self, checks: &[(usize, usize)], hits: &mut Vec<u32>) {
+        for (b, block) in self.blocks.chunks_exact(2 * self.n).enumerate() {
+            let remaining = self.len - 64 * b;
+            let all = if remaining >= 64 {
+                u64::MAX
+            } else {
+                (1 << remaining) - 1
+            };
+            // Representatives without disagreement so far, in either orientation.
+            let (mut same, mut complement) = (all, all);
+            for &(s, c) in checks {
+                same &= !block[s];
+                complement &= !block[c];
+                if same | complement == 0 {
+                    break;
+                }
+            }
+            let mut agreeing = same | complement;
+            while agreeing != 0 {
+                hits.push(64 * b as u32 + agreeing.trailing_zeros());
+                agreeing &= agreeing - 1;
+            }
+        }
+    }
+}
+
+/// For each isolate with data in `pattern`, the words of a block of [`Representatives`]
+/// marking the representatives that disagree with it there: in the same orientation,
+/// and in the complementary one. Isolates in and out of the profile alternate, as each
+/// kind quickly rules out one orientation.
+fn checks(pattern: &Pattern, n: usize) -> Vec<(usize, usize)> {
+    let with_data = |inside: bool| {
+        (0..n)
+            .filter(move |&i| is_set(&pattern.present, i) && is_set(&pattern.profile, i) == inside)
+    };
+    let inside: Vec<(usize, usize)> = with_data(true).map(|i| (n + i, i)).collect();
+    let outside: Vec<(usize, usize)> = with_data(false).map(|i| (i, n + i)).collect();
+    let mut checks = Vec::with_capacity(inside.len() + outside.len());
+    for k in 0..inside.len().max(outside.len()) {
+        checks.extend(inside.get(k));
+        checks.extend(outside.get(k));
+    }
+    checks
 }
 
 /// Processing order: patterns without missing data first, then by decreasing
@@ -249,67 +305,53 @@ fn processing_order(patterns: &[Pattern]) -> Vec<usize> {
     order.sort_unstable_by(|&a, &b| {
         let (pa, pb) = (&patterns[a], &patterns[b]);
         let ((ma, na), (mb, nb)) = (freq[a], freq[b]);
-        (!pa.missing.is_empty())
-            .cmp(&!pb.missing.is_empty())
+        (pa.missing > 0)
+            .cmp(&(pb.missing > 0))
             // ma / na > mb / nb first, compared exactly.
             .then((mb * na).cmp(&(ma * nb)))
-            .then(pa.missing.len().cmp(&pb.missing.len()))
+            .then(pa.missing.cmp(&pb.missing))
             .then(pa.first_column.cmp(&pb.first_column))
     });
     order
 }
 
 /// Greedy clustering of patterns, taken in `order`. Returns the number of clusters and
-/// the clusters of each pattern.
+/// the clusters of each pattern. Patterns are taken by batches of `batch`: those of a
+/// batch are compared in parallel with the representatives created before it, then in
+/// turn with those created by the earlier patterns of the batch.
 fn cluster_patterns(
     patterns: &[Pattern],
     n: usize,
     order: &[usize],
-    use_completions: impl Fn(usize, usize) -> bool,
+    batch: usize,
 ) -> (usize, Vec<Vec<u32>>) {
-    let full = all_isolates(n);
-    // Isolates with data and canonical profile of each cluster's representative.
-    let mut founders: Vec<(Bits, Bits)> = Vec::new();
-    // Completions of indexed representatives. Representatives never agree with each
-    // other, so each completion belongs to a single cluster.
-    let mut index: HashMap<Bits, u32> = HashMap::new();
-    // Representatives whose completions are not indexed.
-    let mut unindexed: Vec<u32> = Vec::new();
+    let mut representatives = Representatives::new(n);
+    // Pattern of each representative.
+    let mut founders: Vec<usize> = Vec::new();
     let mut clusters_of: Vec<Vec<u32>> = vec![Vec::new(); patterns.len()];
-    let mut hits: Vec<u32> = Vec::new();
-    for &p in order {
-        let pattern = &patterns[p];
-        let u = pattern.missing.len();
-        let agrees = |c: &u32| {
-            let (present, profile) = &founders[*c as usize];
-            agree(&pattern.present, &pattern.profile, present, profile)
-        };
-        hits.clear();
-        if use_completions(u, founders.len()) {
-            for_each_completion(pattern, &full, |key| {
-                if let Some(&c) = index.get(key) {
-                    hits.push(c);
-                }
-            });
-            hits.extend(unindexed.iter().filter(|c| agrees(c)));
-            hits.sort_unstable();
-            hits.dedup();
-        } else {
-            hits.extend((0..founders.len() as u32).filter(|c| agrees(c)));
-        }
-        if hits.is_empty() {
-            let c = founders.len() as u32;
-            founders.push((pattern.present.clone(), pattern.profile.clone()));
-            if u <= MAX_INDEXED_MISSING {
-                for_each_completion(pattern, &full, |key| {
-                    index.insert(key.into(), c);
-                });
-            } else {
-                unindexed.push(c);
+    for batch in order.chunks(batch) {
+        let before = founders.len();
+        let found: Vec<Vec<u32>> = batch
+            .par_iter()
+            .map(|&p| {
+                let mut hits = Vec::new();
+                representatives.agreeing(&checks(&patterns[p], n), &mut hits);
+                hits
+            })
+            .collect();
+        for (&p, mut hits) in batch.iter().zip(found) {
+            let a = &patterns[p];
+            hits.extend((before..founders.len()).filter_map(|c| {
+                let b = &patterns[founders[c]];
+                agree(&a.present, &a.profile, &b.present, &b.profile).then_some(c as u32)
+            }));
+            if hits.is_empty() {
+                hits.push(founders.len() as u32);
+                founders.push(p);
+                representatives.push(a);
             }
-            hits.push(c);
+            clusters_of[p] = hits;
         }
-        clusters_of[p] = hits.clone();
     }
     (founders.len(), clusters_of)
 }
@@ -342,9 +384,10 @@ pub(crate) fn cluster_snps(rows: &[Vec<u8>], num_threads: usize) -> anyhow::Resu
                 let present = snp.present.unwrap_or_else(|| full.clone());
                 let key: Bits = present.iter().chain(snp.profile.iter()).copied().collect();
                 let id = *pattern_of_key.entry(key).or_insert_with(|| {
-                    let missing = (0..n as u32)
-                        .filter(|&i| !is_set(&present, i as usize))
-                        .collect();
+                    let missing = n - present
+                        .iter()
+                        .map(|w| w.count_ones() as usize)
+                        .sum::<usize>();
                     patterns.push(Pattern {
                         present,
                         profile: snp.profile,
@@ -361,30 +404,15 @@ pub(crate) fn cluster_snps(rows: &[Vec<u8>], num_threads: usize) -> anyhow::Resu
     }
     drop(pattern_of_key);
     stats.patterns = patterns.len();
-    stats.complete_patterns = patterns.iter().filter(|p| p.missing.is_empty()).count();
+    stats.complete_patterns = patterns.iter().filter(|p| p.missing == 0).count();
 
     let order = processing_order(&patterns);
-    // Enumerate completions when that takes fewer comparisons than scanning clusters.
-    let cheaper = |u: usize, clusters: usize| u < 63 && (1usize << u) <= clusters;
-    let (clusters, clusters_of) = cluster_patterns(&patterns, n, &order, cheaper);
+    let (clusters, pattern_clusters) =
+        pool.install(|| cluster_patterns(&patterns, n, &order, BATCH));
     stats.clusters = clusters;
-    // One entry per (SNP, cluster), in column order.
-    let memberships = snps
-        .iter()
-        .map(|&(_, p)| clusters_of[p as usize].len())
-        .sum();
-    let mut entries = Vec::with_capacity(memberships);
-    let mut weights = Vec::with_capacity(memberships);
-    for &(column, p) in &snps {
-        let clusters = &clusters_of[p as usize];
-        for &c in clusters {
-            entries.push((column, c));
-            weights.push(1.0 / clusters.len() as f64);
-        }
-    }
     Ok(SnpClusters {
-        snps: entries,
-        weights,
+        snps,
+        pattern_clusters,
         stats,
     })
 }
@@ -401,10 +429,22 @@ mod tests {
             .collect()
     }
 
+    /// Column, cluster and weight of each SNP in each of its clusters.
+    fn entries(result: &SnpClusters) -> Vec<(u32, u32, f64)> {
+        let mut entries = Vec::new();
+        for &(column, p) in &result.snps {
+            let clusters = &result.pattern_clusters[p as usize];
+            for &c in clusters {
+                entries.push((column, c, 1.0 / clusters.len() as f64));
+            }
+        }
+        entries
+    }
+
     /// Number of SNPs in each cluster (split SNPs count fractionally).
     fn sizes(result: &SnpClusters) -> Vec<f64> {
         let mut sizes = vec![0.0; result.stats.clusters];
-        for (&(_, cluster), &w) in result.snps.iter().zip(&result.weights) {
+        for (_, cluster, w) in entries(result) {
             sizes[cluster as usize] += w;
         }
         sizes
@@ -493,9 +533,9 @@ mod tests {
         let result = cluster_snps(&rows, 1).unwrap();
         // Four biallelic SNPs and two from the triallelic column.
         assert_eq!(result.snps.len(), 6);
+        let entries = entries(&result);
         let cluster_of = |column: u32| -> Vec<u32> {
-            result
-                .snps
+            entries
                 .iter()
                 .filter(|s| s.0 == column)
                 .map(|s| s.1)
@@ -504,7 +544,7 @@ mod tests {
         assert_eq!(result.stats.clusters, 2);
         assert_eq!(cluster_of(4), vec![cluster_of(0)[0], cluster_of(2)[0]]);
         // Each piece is one whole SNP of its cluster.
-        assert_eq!(result.weights, vec![1.0; 6]);
+        assert!(entries.iter().all(|e| e.2 == 1.0));
         assert_eq!(sizes(&result), vec![3.0, 3.0]);
     }
 
@@ -540,14 +580,8 @@ mod tests {
                 clusters: 3,
             }
         );
-        let entries: Vec<(u32, u32, f64)> = result
-            .snps
-            .iter()
-            .zip(&result.weights)
-            .map(|(&(column, cluster), &w)| (column, cluster, w))
-            .collect();
         assert_eq!(
-            entries,
+            entries(&result),
             vec![
                 (0, 1, 1.0),
                 (1, 1, 1.0),
@@ -576,9 +610,7 @@ mod tests {
             .map(|snp| {
                 let present = snp.present.unwrap_or_else(|| full.clone());
                 Pattern {
-                    missing: (0..n as u32)
-                        .filter(|&i| !is_set(&present, i as usize))
-                        .collect(),
+                    missing: (0..n).filter(|&i| !is_set(&present, i)).count(),
                     present,
                     profile: snp.profile,
                     weight: 1,
@@ -600,7 +632,7 @@ mod tests {
         assert_eq!(result.snps.len(), 6);
     }
 
-    fn random_alignment(n: usize, columns: usize, seed: u64) -> Vec<Vec<u8>> {
+    fn random_alignment(n: usize, columns: usize, splits: usize, seed: u64) -> Vec<Vec<u8>> {
         let mut state = seed;
         let mut next = move || {
             state = state
@@ -609,7 +641,7 @@ mod tests {
             state >> 33
         };
         // A few founder splits with random missing data, so that patterns overlap.
-        let splits: Vec<Vec<bool>> = (0..12)
+        let splits: Vec<Vec<bool>> = (0..splits)
             .map(|_| (0..n).map(|_| next() % 3 == 0).collect())
             .collect();
         let cols: Vec<String> = (0..columns)
@@ -629,11 +661,38 @@ mod tests {
         alignment(&refs)
     }
 
+    /// Greedy clustering by comparing each pattern with every representative.
+    fn cluster_patterns_directly(patterns: &[Pattern], order: &[usize]) -> Vec<Vec<u32>> {
+        let mut representatives: Vec<&Pattern> = Vec::new();
+        let mut clusters_of = vec![Vec::new(); patterns.len()];
+        for &p in order {
+            let a = &patterns[p];
+            let mut hits: Vec<u32> = (0..representatives.len() as u32)
+                .filter(|&c| {
+                    let b = representatives[c as usize];
+                    agree(&a.present, &a.profile, &b.present, &b.profile)
+                })
+                .collect();
+            if hits.is_empty() {
+                hits.push(representatives.len() as u32);
+                representatives.push(a);
+            }
+            clusters_of[p] = hits;
+        }
+        clusters_of
+    }
+
     #[test]
-    fn completion_lookups_and_direct_comparison_give_identical_clusters() {
-        for (n, seed) in [(9, 1), (40, 2), (70, 3)] {
-            let rows = random_alignment(n, 400, seed);
-            let words = n.div_ceil(64);
+    fn representatives_agree_as_in_direct_comparison() {
+        // Up to 3 words per isolate set, and several blocks of 64 representatives.
+        for (n, splits, seed) in [
+            (9, 12, 1),
+            (40, 12, 2),
+            (70, 12, 3),
+            (70, 300, 4),
+            (150, 300, 5),
+        ] {
+            let rows = random_alignment(n, 2000, splits, seed);
             let full: Bits = bits(n, &(0..n).collect::<Vec<_>>());
             let mut keyed: HashMap<Bits, usize> = HashMap::new();
             let mut patterns = Vec::new();
@@ -641,41 +700,40 @@ mod tests {
             for snp in snps {
                 let present = snp.present.unwrap_or_else(|| full.clone());
                 let key: Bits = present.iter().chain(snp.profile.iter()).copied().collect();
-                let id = *keyed.entry(key).or_insert_with(|| {
+                keyed.entry(key).or_insert_with(|| {
                     patterns.push(Pattern {
-                        missing: (0..n as u32)
-                            .filter(|&i| !is_set(&present, i as usize))
-                            .collect(),
+                        missing: (0..n).filter(|&i| !is_set(&present, i)).count(),
                         present,
                         profile: snp.profile,
-                        weight: 0,
+                        weight: 1,
                         first_column: snp.column,
                     });
                     patterns.len() - 1
                 });
-                patterns[id].weight += 1;
             }
-            assert_eq!(words, patterns[0].present.len());
             let order = processing_order(&patterns);
-            let run =
-                |method: fn(usize, usize) -> bool| cluster_patterns(&patterns, n, &order, method);
-            // Completions only where enumerable; direct comparison everywhere.
-            let lookups = run(|u, _| u <= 16);
-            let direct = run(|_, _| false);
-            assert_eq!(lookups, direct, "n={n}");
+            let direct = cluster_patterns_directly(&patterns, &order);
+            // Whole batches, a single batch, and batches of one pattern.
+            for batch in [1, 7, 64, BATCH] {
+                let (clusters, clusters_of) = cluster_patterns(&patterns, n, &order, batch);
+                if splits > 64 {
+                    assert!(clusters > 128, "n={n}: {clusters} clusters");
+                }
+                assert_eq!(clusters_of, direct, "n={n} batch={batch}");
+            }
         }
     }
 
     #[test]
     fn results_do_not_depend_on_thread_count() {
-        let rows = random_alignment(130, 900, 7);
+        let rows = random_alignment(130, 900, 12, 7);
         let one = cluster_snps(&rows, 1).unwrap();
         let four = cluster_snps(&rows, 4).unwrap();
         assert_eq!(one.stats, four.stats);
         assert_eq!(one.snps, four.snps);
-        assert_eq!(one.weights, four.weights);
+        assert_eq!(one.pattern_clusters, four.pattern_clusters);
         // Each SNP's weights sum to 1 (all columns are biallelic here).
-        let total: f64 = one.weights.iter().sum();
+        let total: f64 = entries(&one).iter().map(|e| e.2).sum();
         let mut columns: Vec<u32> = one.snps.iter().map(|s| s.0).collect();
         columns.dedup();
         assert!((total - columns.len() as f64).abs() < 1e-6);

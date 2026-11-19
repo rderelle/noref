@@ -105,6 +105,17 @@ impl Roller {
     }
 }
 
+/// Reverse-complement code of the code of a `k`-mer.
+#[inline]
+pub(crate) fn revcomp_code(code: u64, k: usize) -> u64 {
+    // Complement all 32 bases, reverse the order of the 2-bit groups (bytes, then
+    // nibbles, then bases), and drop the bases beyond the k-mer.
+    let x = (!code).swap_bytes();
+    let x = ((x >> 4) & 0x0f0f_0f0f_0f0f_0f0f) | ((x & 0x0f0f_0f0f_0f0f_0f0f) << 4);
+    let x = ((x >> 2) & 0x3333_3333_3333_3333) | ((x & 0x3333_3333_3333_3333) << 2);
+    x >> (64 - 2 * k)
+}
+
 #[cfg(test)]
 pub(crate) fn pack(seq: &[u8]) -> u64 {
     seq.iter().fold(0, |v, &b| (v << 2) | encode(b) as u64)
@@ -141,6 +152,7 @@ mod tests {
                     let kmer = &seq[i + 1 - k..=i];
                     assert_eq!(roller.fwd, pack(kmer));
                     assert_eq!(roller.rc, pack(&revcomp(kmer)));
+                    assert_eq!(revcomp_code(roller.fwd, k), roller.rc);
                 }
             }
             roller.reset();

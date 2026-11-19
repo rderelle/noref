@@ -462,7 +462,7 @@ fn mask_recombination(
     say!(log, "# mask concentrated SNPs");
     let layout = recombination::SnpLayout {
         snps: &clusters.snps,
-        weights: &clusters.weights,
+        pattern_clusters: &clusters.pattern_clusters,
         n_clusters: clusters.stats.clusters,
         group_ends: &alignment.group_ends,
         positions: &alignment.positions,

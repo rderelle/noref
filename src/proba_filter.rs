@@ -6,14 +6,15 @@
 //! (Bloom) or one 64-byte cache line (CMS). Keys are processed in batches, and the
 //! word or line of a key is prefetched [`AHEAD`] keys before it is used: these tables
 //! are far larger than the CPU caches, so most of the time would otherwise be spent
-//! waiting for memory, one key at a time.
+//! waiting for memory, one key at a time. Threads count into the CMS region by region
+//! (see [`SharedSketch`]).
 //!
 //! False positive trade-offs:
 //! - Bloom false positives cause undercounting (k-mers may look already seen),
 //!   which is conservative.
 //! - CMS collisions overestimate counts, which is permissive.
 
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::Mutex;
 
 /// Per-genome Bloom filter size (16 MiB): keeps false positives (which slightly
 /// undercount occupancies) well below 1% for bacterial-sized genomes.
@@ -121,36 +122,42 @@ impl BloomFilter {
     }
 }
 
-/// Line and four distinct counter slots (one per 8-counter quarter) of a key.
+/// CMS hash of a key: its low bits select the line, its top 12 bits the counters.
 #[inline]
-fn probes(key: u64, mask: u64) -> (usize, [usize; PROBES]) {
-    let h = mix64(key ^ SEEDS[1]);
-    let s = (h >> 52) as usize;
-    (
-        (h & mask) as usize,
-        [
-            s & 7,
-            8 + ((s >> 3) & 7),
-            16 + ((s >> 6) & 7),
-            24 + ((s >> 9) & 7),
-        ],
-    )
+fn cms_hash(key: u64) -> u64 {
+    mix64(key ^ SEEDS[1])
 }
 
-/// Prefetch the line of the key used [`AHEAD`] keys after `keys[i]`.
-#[inline(always)]
-fn prefetch_ahead<L>(lines: &[L], mask: u64, keys: &[u64], i: usize) {
-    if let Some(&next) = keys.get(i + AHEAD) {
-        prefetch(&lines[probes(next, mask).0]);
-    }
+/// Four distinct counter slots (one per 8-counter quarter) of a CMS hash.
+#[inline]
+fn slots(h: u64) -> [usize; PROBES] {
+    let s = (h >> 52) as usize;
+    [
+        s & 7,
+        8 + ((s >> 3) & 7),
+        16 + ((s >> 6) & 7),
+        24 + ((s >> 9) & 7),
+    ]
 }
 
 #[repr(C, align(64))]
 #[derive(Clone)]
 struct Line([u16; LINE]);
 
-#[repr(C, align(64))]
-struct AtomicLine([AtomicU16; LINE]);
+/// Count each hash once in `lines` (a power-of-two number of lines, selected by
+/// the low bits of the hash).
+fn increment_lines(lines: &mut [Line], hashes: &[u64]) {
+    let mask = lines.len() as u64 - 1;
+    for (i, &h) in hashes.iter().enumerate() {
+        if let Some(&next) = hashes.get(i + AHEAD) {
+            prefetch(&lines[(next & mask) as usize]);
+        }
+        let line = &mut lines[(h & mask) as usize].0;
+        for s in slots(h) {
+            line[s] = line[s].saturating_add(1);
+        }
+    }
+}
 
 pub struct CountMinSketch {
     lines: Vec<Line>,
@@ -166,26 +173,32 @@ impl CountMinSketch {
         }
     }
 
-    /// Count each key once (single writer, no atomics).
+    /// Count each key once (single writer).
+    #[cfg(test)]
     pub fn increment_batch(&mut self, keys: &[u64]) {
-        for (i, &key) in keys.iter().enumerate() {
-            prefetch_ahead(&self.lines, self.mask, keys, i);
-            let (line, slots) = probes(key, self.mask);
-            let line = &mut self.lines[line].0;
-            for s in slots {
-                line[s] = line[s].saturating_add(1);
-            }
-        }
+        let hashes: Vec<u64> = keys.iter().map(|&key| cms_hash(key)).collect();
+        increment_lines(&mut self.lines, &hashes);
     }
 
     /// Write the estimated number of genomes containing `keys[i]` into `out[i]`
     /// (minimum of the key's counters).
     pub fn estimate_batch(&self, keys: &[u64], out: &mut [u16]) {
         for (i, (&key, out)) in keys.iter().zip(out).enumerate() {
-            prefetch_ahead(&self.lines, self.mask, keys, i);
-            let (line, slots) = probes(key, self.mask);
-            let line = &self.lines[line].0;
-            *out = slots.iter().map(|&s| line[s]).min().unwrap_or(0);
+            if let Some(&next) = keys.get(i + AHEAD) {
+                prefetch(&self.lines[(cms_hash(next) & self.mask) as usize]);
+            }
+            let h = cms_hash(key);
+            let line = &self.lines[(h & self.mask) as usize].0;
+            *out = slots(h).iter().map(|&s| line[s]).min().unwrap_or(0);
+        }
+    }
+
+    /// Share the sketch between threads for counting.
+    pub fn shared(&mut self) -> SharedSketch<'_> {
+        let len = self.lines.len() / REGIONS.min(self.lines.len());
+        SharedSketch {
+            regions: self.lines.chunks_mut(len).map(Mutex::new).collect(),
+            shift: len.trailing_zeros(),
         }
     }
 
@@ -197,58 +210,67 @@ impl CountMinSketch {
     }
 }
 
-/// Thread-safe CMS used during parallel counting.
-pub struct AtomicCountMinSketch {
-    lines: Vec<AtomicLine>,
-    mask: u64,
+/// Number of regions (blocks of consecutive lines) of a [`SharedSketch`].
+const REGIONS: usize = 256;
+/// Keys a [`SketchWriter`] buffers per region (2 MiB in all).
+const REGION_BUFFER: usize = 1 << 10;
+
+/// A [`CountMinSketch`] that several threads count into without atomic counters:
+/// each region has its own lock, and threads add their keys region by region
+/// through a [`SketchWriter`]. Increments commute, so the counts do not depend on
+/// the order of the keys (nor on the number of threads); updating one region at a
+/// time also makes memory accesses much more local.
+pub struct SharedSketch<'a> {
+    regions: Vec<Mutex<&'a mut [Line]>>,
+    /// log2 of the number of lines per region.
+    shift: u32,
 }
 
-/// Add 1 to `counter` unless it already holds `u16::MAX` (lock-free).
-///
-/// Written out rather than with `fetch_update`, which recent Rust deprecates in
-/// favour of `try_update`, too recent for the minimum Rust version (1.88).
-fn saturating_increment(counter: &AtomicU16) {
-    let mut current = counter.load(Ordering::Relaxed);
-    while let Some(next) = current.checked_add(1) {
-        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => return,
-            Err(actual) => current = actual,
+impl<'a> SharedSketch<'a> {
+    pub fn writer(&self) -> SketchWriter<'_, 'a> {
+        SketchWriter {
+            buffers: (0..self.regions.len())
+                .map(|_| Vec::with_capacity(REGION_BUFFER))
+                .collect(),
+            sketch: self,
         }
     }
 }
 
-impl AtomicCountMinSketch {
-    pub fn new(lines: usize) -> Self {
-        let n = lines.max(1).next_power_of_two();
-        let mut lines = Vec::with_capacity(n);
-        lines.resize_with(n, || AtomicLine(std::array::from_fn(|_| AtomicU16::new(0))));
-        Self {
-            lines,
-            mask: n as u64 - 1,
-        }
-    }
+/// Buffers the keys of one thread per region of a [`SharedSketch`]; a full buffer
+/// is counted under the lock of its region. Call [`Self::finish`] when done.
+pub struct SketchWriter<'s, 'a> {
+    sketch: &'s SharedSketch<'a>,
+    /// CMS hashes of the buffered keys, per region.
+    buffers: Vec<Vec<u64>>,
+}
 
-    /// Count each key once, with saturating atomic increments.
-    pub fn increment_batch(&self, keys: &[u64]) {
-        for (i, &key) in keys.iter().enumerate() {
-            prefetch_ahead(&self.lines, self.mask, keys, i);
-            let (line, slots) = probes(key, self.mask);
-            let line = &self.lines[line].0;
-            for s in slots {
-                saturating_increment(&line[s]);
+impl SketchWriter<'_, '_> {
+    /// Count each key once.
+    pub fn add(&mut self, keys: &[u64]) {
+        let region_mask = self.buffers.len() as u64 - 1;
+        for &key in keys {
+            let h = cms_hash(key);
+            let region = ((h >> self.sketch.shift) & region_mask) as usize;
+            self.buffers[region].push(h);
+            if self.buffers[region].len() == REGION_BUFFER {
+                self.flush(region);
             }
         }
     }
 
-    /// Consume the finished sketch; same-layout conversion reuses the allocation.
-    pub fn into_snapshot(self) -> CountMinSketch {
-        CountMinSketch {
-            lines: self
-                .lines
-                .into_iter()
-                .map(|l| Line(l.0.map(AtomicU16::into_inner)))
-                .collect(),
-            mask: self.mask,
+    fn flush(&mut self, region: usize) {
+        let mut lines = self.sketch.regions[region]
+            .lock()
+            .expect("sketch region mutex poisoned");
+        increment_lines(&mut lines, &self.buffers[region]);
+        self.buffers[region].clear();
+    }
+
+    /// Count the keys still buffered.
+    pub fn finish(mut self) {
+        for region in 0..self.buffers.len() {
+            self.flush(region);
         }
     }
 }
@@ -258,11 +280,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn probes_use_one_slot_per_quarter() {
+    fn slots_use_one_counter_per_quarter() {
         for key in 0..10_000u64 {
-            let (line, slots) = probes(key, (1 << 23) - 1);
-            assert!(line < 1 << 23);
-            for (q, &s) in slots.iter().enumerate() {
+            for (q, &s) in slots(cms_hash(key)).iter().enumerate() {
                 assert!((8 * q..8 * q + 8).contains(&s));
             }
         }
@@ -298,28 +318,49 @@ mod tests {
         assert_eq!(batched.words, single.words);
     }
 
+    /// Count `keys` (then key 42 often enough to saturate) with `threads` writers.
+    fn shared_counts(lines: usize, keys: &[u64], threads: usize) -> CountMinSketch {
+        let mut cms = CountMinSketch::new(lines);
+        let shared = cms.shared();
+        std::thread::scope(|scope| {
+            for t in 0..threads {
+                let shared = &shared;
+                scope.spawn(move || {
+                    let mut writer = shared.writer();
+                    for chunk in keys.chunks(97).skip(t).step_by(threads) {
+                        writer.add(chunk);
+                    }
+                    for _ in 0..65536 / threads + 1 {
+                        writer.add(&[42]);
+                    }
+                    writer.finish();
+                });
+            }
+        });
+        drop(shared);
+        cms
+    }
+
     #[test]
-    fn plain_and_atomic_counts_match_including_collisions_and_saturation() {
+    fn shared_and_single_writer_counts_match_including_collisions_and_saturation() {
+        let keys: Vec<u64> = (0..5000).map(|i| mix64(i % 311)).collect();
+        let queries: Vec<u64> = (0..1200).map(mix64).chain([42]).collect();
         for lines in [1, 4, 1024, 1 << 12] {
             let mut plain = CountMinSketch::new(lines);
-            let atomic = AtomicCountMinSketch::new(lines);
-            let keys: Vec<u64> = (0..1000).map(|i| mix64(i % 311)).collect();
             plain.increment_batch(&keys);
-            atomic.increment_batch(&keys);
-            for _ in 0..65536 {
-                plain.increment_batch(&[42]);
-                atomic.increment_batch(&[42]);
-            }
-            let frozen = atomic.into_snapshot();
-            let queries: Vec<u64> = (0..1200).map(mix64).chain([42]).collect();
-            let (mut a, mut b) = (vec![0; queries.len()], vec![0; queries.len()]);
-            plain.estimate_batch(&queries, &mut a);
-            frozen.estimate_batch(&queries, &mut b);
-            assert_eq!(a, b);
-            for (&q, &est) in queries.iter().zip(&a) {
+            plain.increment_batch(&[42; 65536]);
+            let mut expected = vec![0; queries.len()];
+            plain.estimate_batch(&queries, &mut expected);
+            for (&q, &est) in queries.iter().zip(&expected) {
                 assert_eq!(est, plain.estimate(q));
             }
             assert_eq!(plain.estimate(42), u16::MAX);
+            for threads in [1, 3] {
+                let shared = shared_counts(lines, &keys, threads);
+                let mut found = vec![0; queries.len()];
+                shared.estimate_batch(&queries, &mut found);
+                assert_eq!(found, expected);
+            }
         }
     }
 
@@ -333,21 +374,5 @@ mod tests {
         for key in 0..5000u64 {
             assert!(cms.estimate(key) >= (key % 7) as u16);
         }
-    }
-
-    #[test]
-    fn concurrent_updates_keep_saturating_counts() {
-        let atomic = AtomicCountMinSketch::new(1);
-        std::thread::scope(|scope| {
-            for _ in 0..4 {
-                let atomic = &atomic;
-                scope.spawn(move || {
-                    for _ in 0..20000 {
-                        atomic.increment_batch(&[42]);
-                    }
-                });
-            }
-        });
-        assert_eq!(atomic.into_snapshot().estimate(42), u16::MAX);
     }
 }
