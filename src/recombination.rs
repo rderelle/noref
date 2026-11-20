@@ -49,8 +49,6 @@ pub(crate) struct RecombinationStats {
     pub(crate) masked_cells: usize,
     /// SNP columns masked in at least one isolate, in ascending order.
     pub(crate) masked_columns: Vec<u32>,
-    /// Isolates with at least one masked SNP.
-    pub(crate) isolates: usize,
     /// Only when requested (see [`mask_recombinant_snps`]): per isolate, the masked
     /// columns in ascending order with their base before masking.
     pub(crate) original_bases: Vec<Vec<(u32, u8)>>,
@@ -639,7 +637,6 @@ pub(crate) fn mask_recombinant_snps(
         }
         stats.cells += cells;
         stats.masked_cells += masked;
-        stats.isolates += (masked > 0) as usize;
     }
     let column_masked: Vec<u64> = column_masked
         .into_iter()
@@ -808,14 +805,7 @@ mod tests {
         assert!(rows[0][6..].iter().all(|&b| b == b'A'));
         assert!(rows[1].iter().all(|&b| b == b'C'));
         assert_eq!(stats.cells, 52);
-        assert_eq!(
-            (
-                stats.masked_cells,
-                stats.masked_columns.len(),
-                stats.isolates
-            ),
-            (6, 6, 1)
-        );
+        assert_eq!((stats.masked_cells, stats.masked_columns.len()), (6, 6));
         assert_eq!(n, rows.len());
         assert!(stats.original_bases.is_empty());
 
