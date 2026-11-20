@@ -1,13 +1,25 @@
 ##gff-version 3
 ##sequence-region SEQUENCE 1 20000
-# noref 0.1.0: SNPs of the alignment columns removed after recombination masking, on the genome of G7 (contigs end to end), merged into blocks when less than 5000 bp apart
-SEQUENCE	GUBBINS	CDS	2521	6483	0.000	.	0	node="G1";neg_log_likelihood="0";taxa="G1";snp_count="6";program="noref";
-SEQUENCE	GUBBINS	CDS	7344	7810	0.000	.	0	node="G1";neg_log_likelihood="0";taxa="G1";snp_count="5";program="noref";
-SEQUENCE	GUBBINS	CDS	8019	10067	0.000	.	0	node="G1";neg_log_likelihood="0";taxa="G1";snp_count="15";program="noref";
-SEQUENCE	GUBBINS	CDS	10173	12147	0.000	.	0	node="G1";neg_log_likelihood="0";taxa="G1";snp_count="20";program="noref";
-SEQUENCE	GUBBINS	CDS	16040	17019	0.000	.	0	node="G1";neg_log_likelihood="0";taxa="G1";snp_count="2";program="noref";
-SEQUENCE	GUBBINS	CDS	44	3894	0.000	.	0	node="G2";neg_log_likelihood="0";taxa="G2";snp_count="4";program="noref";
-SEQUENCE	GUBBINS	CDS	7344	7810	0.000	.	0	node="G3";neg_log_likelihood="0";taxa="G3";snp_count="5";program="noref";
-SEQUENCE	GUBBINS	CDS	8019	10067	0.000	.	0	node="G3";neg_log_likelihood="0";taxa="G3";snp_count="15";program="noref";
-SEQUENCE	GUBBINS	CDS	10173	12309	0.000	.	0	node="G3";neg_log_likelihood="0";taxa="G3";snp_count="22";program="noref";
-SEQUENCE	GUBBINS	CDS	44	3894	0.000	.	0	node="G8";neg_log_likelihood="0";taxa="G8";snp_count="2";program="noref";
+# noref 0.1.0: non-ancestral bases of the alignment columns removed after recombination masking, on the genome of G7 (contigs end to end), merged into blocks when less than 5000 bp apart
+SEQUENCE	GUBBINS	CDS	628	628	0.000	.	0	node="G1";neg_log_likelihood="0";taxa="G1";snp_count="1";program="noref";
+SEQUENCE	GUBBINS	CDS	10817	10934	0.000	.	0	node="G1";neg_log_likelihood="0";taxa="G1";snp_count="2";program="noref";
+SEQUENCE	GUBBINS	CDS	628	1504	0.000	.	0	node="G2";neg_log_likelihood="0";taxa="G2";snp_count="2";program="noref";
+SEQUENCE	GUBBINS	CDS	9822	9986	0.000	.	0	node="G2";neg_log_likelihood="0";taxa="G2";snp_count="3";program="noref";
+SEQUENCE	GUBBINS	CDS	10290	14448	0.000	.	0	node="G2";neg_log_likelihood="0";taxa="G2";snp_count="25";program="noref";
+SEQUENCE	GUBBINS	CDS	14792	14979	0.000	.	0	node="G2";neg_log_likelihood="0";taxa="G2";snp_count="3";program="noref";
+SEQUENCE	GUBBINS	CDS	9347	9347	0.000	.	0	node="G3";neg_log_likelihood="0";taxa="G3";snp_count="1";program="noref";
+SEQUENCE	GUBBINS	CDS	44	5024	0.000	.	0	node="G4";neg_log_likelihood="0";taxa="G4";snp_count="42";program="noref";
+SEQUENCE	GUBBINS	CDS	8766	8766	0.000	.	0	node="G4";neg_log_likelihood="0";taxa="G4";snp_count="1";program="noref";
+SEQUENCE	GUBBINS	CDS	10713	12309	0.000	.	0	node="G4";neg_log_likelihood="0";taxa="G4";snp_count="4";program="noref";
+SEQUENCE	GUBBINS	CDS	7427	7427	0.000	.	0	node="G5";neg_log_likelihood="0";taxa="G5";snp_count="1";program="noref";
+SEQUENCE	GUBBINS	CDS	8766	8766	0.000	.	0	node="G5";neg_log_likelihood="0";taxa="G5";snp_count="1";program="noref";
+SEQUENCE	GUBBINS	CDS	12147	12147	0.000	.	0	node="G5";neg_log_likelihood="0";taxa="G5";snp_count="1";program="noref";
+SEQUENCE	GUBBINS	CDS	1394	1394	0.000	.	0	node="G6";neg_log_likelihood="0";taxa="G6";snp_count="1";program="noref";
+SEQUENCE	GUBBINS	CDS	8766	8766	0.000	.	0	node="G6";neg_log_likelihood="0";taxa="G6";snp_count="1";program="noref";
+SEQUENCE	GUBBINS	CDS	12147	12147	0.000	.	0	node="G6";neg_log_likelihood="0";taxa="G6";snp_count="1";program="noref";
+SEQUENCE	GUBBINS	CDS	44	6483	0.000	.	0	node="G7";neg_log_likelihood="0";taxa="G7";snp_count="7";program="noref";
+SEQUENCE	GUBBINS	CDS	7344	7810	0.000	.	0	node="G7";neg_log_likelihood="0";taxa="G7";snp_count="5";program="noref";
+SEQUENCE	GUBBINS	CDS	8019	10067	0.000	.	0	node="G7";neg_log_likelihood="0";taxa="G7";snp_count="15";program="noref";
+SEQUENCE	GUBBINS	CDS	10173	12309	0.000	.	0	node="G7";neg_log_likelihood="0";taxa="G7";snp_count="22";program="noref";
+SEQUENCE	GUBBINS	CDS	16040	17019	0.000	.	0	node="G7";neg_log_likelihood="0";taxa="G7";snp_count="2";program="noref";
+SEQUENCE	GUBBINS	CDS	12309	12836	0.000	.	0	node="G8";neg_log_likelihood="0";taxa="G8";snp_count="2";program="noref";
