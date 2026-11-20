@@ -14,7 +14,8 @@ In most bacterial phylogenomic workflows, SNP calling and recombination detectio
 noref was developed to perform both steps, SNP calling and detection of recombination tracts, in a reference-free manner.
 This reduces biases and greatly simplifies phylogenetic workflows: there is no need to choose a suitable reference, and both steps are handled by a single tool.
 
-Please note that this tool is still under development.
+> [!NOTE]
+> Please note that this tool is still under development.
 
 ## under the hood
 - SNP calling: this is essentially the algorithm developed in [kamino](https://github.com/rderelle/kamino), but using nucleotides instead of amino acids. Also, the genomic positions in the original input assemblies of each extracted sequence from each variant group are saved in memory instead of protein names, allowing the next step to happen.
@@ -62,6 +63,11 @@ Bacterial genome assemblies in a directory with `-i`, or paths of input files pr
 ## output
 SNP alignments (with some constant positions; not a pseudo-alignment of genomes), midpoint rooted NJ trees with `--nj`, and a recombination gff file for [Phandango](https://github.com/jameshadfield/phandango) with `-p`/`--plot`.
 For the latter, the name of the input isolate whose genome the recombinant SNPs will be mapped onto should be indicated.
+
+> [!TIP]
+> IMHO, whether to include recombinant SNPs in phylogenetic analyses depends on the question being asked:
+> - *How different or similar are the isolates to each other?* -> all SNPs
+> - *How related are the isolates to each other* -> non-recombinant SNPs (filtered SNPs)
 
 ---
 This codebase is provided under the MIT License. The code was drafted using AI assistance.
