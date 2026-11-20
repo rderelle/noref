@@ -69,6 +69,8 @@ Bacterial genome assemblies in a directory with `-i`, or paths of input files pr
 SNP alignments (with some constant positions; not a pseudo-alignment of genomes), midpoint rooted NJ trees with `--nj`, and a recombination gff file for [Phandango](https://github.com/jameshadfield/phandango) with `-p`/`--plot`.
 For the latter, the name of the input isolate whose genome the recombinant SNPs will be mapped onto should be indicated.
 
+Unlike ClonalFrameML and Gubbins, noref operates in reference-free mode and makes no attempt at determining when and where a recombination occurred. So the Phandango plot suffers from 2 caveats: (i) not all masked SNPs will be represented using the chosen genome and (ii) the polarisation of recombination events is approximate (done here by parsimony on the midpoint-rooted NJ tree).
+
 > [!TIP]
 > IMHO, whether to include recombinant SNPs in phylogenetic analyses depends on the question being asked:
 > - *How different or similar are the isolates to each other?* -> all SNPs
