@@ -54,8 +54,6 @@ type Bits = Box<[u64]>;
 /// Counts printed after each run.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct SnpStats {
-    /// Columns with at least two bases.
-    pub(crate) polymorphic: usize,
     /// Distinct (isolates with data, profile) combinations.
     pub(crate) patterns: usize,
     /// Patterns with data in every isolate.
@@ -127,11 +125,11 @@ fn canonicalize(profile: &mut [u64], present: &[u64]) -> bool {
     profile.iter().any(|&w| w != 0)
 }
 
-/// Scan columns `start..end` of the alignment; returns their SNPs, in column order, and
-/// the number of polymorphic columns. A column with three or four bases gives one SNP per base other than
-/// the most frequent one; if the two most frequent bases are equally frequent (never
+/// Scan columns `start..end` of the alignment; returns their SNPs, in column order. A
+/// column with three or four bases gives one SNP per base other than the most frequent
+/// one; if the two most frequent bases are equally frequent (never
 /// the case after [`crate::group_filtering`]), it gives none.
-fn scan_columns(rows: &[Vec<u8>], start: usize, end: usize) -> (Vec<ColumnSnp>, usize) {
+fn scan_columns(rows: &[Vec<u8>], start: usize, end: usize) -> Vec<ColumnSnp> {
     let (n, width) = (rows.len(), end - start);
     let words = n.div_ceil(64);
     // One bitset per column and base (A, C, G, T).
@@ -148,7 +146,6 @@ fn scan_columns(rows: &[Vec<u8>], start: usize, end: usize) -> (Vec<ColumnSnp>, 
     let full = all_isolates(n);
     let count = |m: &[u64]| m.iter().map(|w| w.count_ones()).sum::<u32>();
     let mut snps = Vec::new();
-    let mut polymorphic = 0;
     for j in 0..width {
         let column = &masks[j * 4 * words..(j + 1) * 4 * words];
         let bases: Vec<&[u64]> = column
@@ -158,7 +155,6 @@ fn scan_columns(rows: &[Vec<u8>], start: usize, end: usize) -> (Vec<ColumnSnp>, 
         if bases.len() < 2 {
             continue;
         }
-        polymorphic += 1;
         let present: Bits = (0..words)
             .map(|w| bases.iter().fold(0, |acc, m| acc | m[w]))
             .collect();
@@ -191,7 +187,7 @@ fn scan_columns(rows: &[Vec<u8>], start: usize, end: usize) -> (Vec<ColumnSnp>, 
             }
         }
     }
-    (snps, polymorphic)
+    snps
 }
 
 /// Whether two profiles agree on the isolates where both have data.
@@ -372,14 +368,13 @@ pub(crate) fn cluster_snps(rows: &[Vec<u8>], num_threads: usize) -> anyhow::Resu
     let mut snps: Vec<(u32, u32)> = Vec::new();
     let n_chunks = len.div_ceil(CHUNK);
     for batch in (0..n_chunks).step_by(CHUNKS_PER_BATCH) {
-        let scanned: Vec<(Vec<ColumnSnp>, usize)> = pool.install(|| {
+        let scanned: Vec<Vec<ColumnSnp>> = pool.install(|| {
             (batch..(batch + CHUNKS_PER_BATCH).min(n_chunks))
                 .into_par_iter()
                 .map(|c| scan_columns(rows, c * CHUNK, ((c + 1) * CHUNK).min(len)))
                 .collect()
         });
-        for (chunk, polymorphic) in scanned {
-            stats.polymorphic += polymorphic;
+        for chunk in scanned {
             for snp in chunk {
                 let present = snp.present.unwrap_or_else(|| full.clone());
                 let key: Bits = present.iter().chain(snp.profile.iter()).copied().collect();
@@ -481,8 +476,7 @@ mod tests {
             "A-CN", // biallelic with missing data
             "----", // empty
         ]);
-        let (snps, polymorphic) = scan_columns(&rows, 0, 6);
-        assert_eq!(polymorphic, 4);
+        let snps = scan_columns(&rows, 0, 6);
         let columns: Vec<u32> = snps.iter().map(|s| s.column).collect();
         assert_eq!(columns, vec![1, 2, 3, 3, 4]);
         assert_eq!(snps[0].profile, bits(4, &[2, 3]));
@@ -503,8 +497,7 @@ mod tests {
             "CAATT-T", // T most frequent, isolate 5 missing: SNPs for A and C
             "AACCG--", // A and C tied: no SNP
         ]);
-        let (snps, polymorphic) = scan_columns(&rows, 0, 3);
-        assert_eq!(polymorphic, 3);
+        let snps = scan_columns(&rows, 0, 3);
         let found: Vec<(u32, Bits)> = snps.iter().map(|s| (s.column, s.profile.clone())).collect();
         assert_eq!(
             found,
@@ -574,7 +567,6 @@ mod tests {
         assert_eq!(
             result.stats,
             SnpStats {
-                polymorphic: 8,
                 patterns: 6,
                 complete_patterns: 2,
                 clusters: 3,
@@ -602,7 +594,7 @@ mod tests {
         // The incomplete pattern is the most informative but comes after the complete
         // one; among incomplete patterns the 50% split comes before the 1-isolate one.
         let rows = alignment(&["AAAAAC", "-AACCC", "-AAAAC"]);
-        let (snps, _) = scan_columns(&rows, 0, 3);
+        let snps = scan_columns(&rows, 0, 3);
         let n = 6;
         let full = bits(n, &(0..n).collect::<Vec<_>>());
         let patterns: Vec<Pattern> = snps
@@ -696,7 +688,7 @@ mod tests {
             let full: Bits = bits(n, &(0..n).collect::<Vec<_>>());
             let mut keyed: HashMap<Bits, usize> = HashMap::new();
             let mut patterns = Vec::new();
-            let (snps, _) = scan_columns(&rows, 0, rows[0].len());
+            let snps = scan_columns(&rows, 0, rows[0].len());
             for snp in snps {
                 let present = snp.present.unwrap_or_else(|| full.clone());
                 let key: Bits = present.iter().chain(snp.profile.iter()).copied().collect();

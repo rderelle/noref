@@ -57,6 +57,11 @@ This dataset corresponds to the Euro-GASP 2020 study published by [Golparian et 
 
 ![noref result for the pneumo dataset](images/neisseria.png)
 
+#### 731 MTBC genomes (31s/4.3GB)
+This dataset ([here](https://github.com/rderelle/barcodes-fastlin/blob/main/out_fastlin_v3.txt) + H37Rv genome) is my negative control, since M. canettii undergoes extensive recombination, whereas M. tuberculosis is largely clonal. The plot shows numerous recombination tracts in M. canettii (top), but only a few in M. tuberculosis. The main one corresponds to 4 SNPs located in a genomic island described by [Beck et al 2007](https://academic.oup.com/mbe/article/24/8/1861/1111692) while others could be false positives (?).
+
+![noref result for the pneumo dataset](images/mtbc.png)
+
 ## input
 Bacterial genome assemblies in a directory with `-i`, or paths of input files provided in a headerless tab-delimited file using the `-I` argument (see [here](https://github.com/rderelle/kamino#input) for more details).
 

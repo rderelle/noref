@@ -4,10 +4,13 @@
 //! The SNP columns removed from the alignment after recombination masking (those
 //! failing the second `-f` check, see [`crate::recombination::failing_columns`]) are
 //! placed on the genome of a reference isolate, at the position of their variant
-//! group in that genome. In each of these columns, every other isolate in which the
-//! SNP was masked and whose base (before masking) differs from the base of the
-//! reference is reported as carrying a recombinant SNP. A column cannot be placed
-//! when the reference has no base in it.
+//! group in that genome; a column cannot be placed when the reference lacks that
+//! group. In each column, every isolate whose base (before masking) differs from the
+//! ancestral base is reported as carrying a recombinant SNP (masking covers both
+//! sides of a SNP, so it does not tell which isolates carry the change). The ancestral
+//! base is the most parsimonious base (Fitch-Hartigan, missing bases matching any) at
+//! the root of the midpoint-rooted NJ tree of the filtered alignment, or the most
+//! frequent of several equally parsimonious ones.
 //!
 //! For each isolate, SNPs less than one window (`-w`) apart on the same contig of the
 //! reference are merged into one block, from the first to the last SNP. Blocks are
@@ -24,24 +27,23 @@ use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
+use crate::dna::{encode, INVALID};
 use crate::group_filtering::NO_POSITION;
+use crate::phylo::Postorder;
 
 /// SNPs of the removed columns, placed on the reference genome.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct MappedSnps {
-    /// Per isolate: reference positions of its masked SNPs that differ from the
-    /// reference.
+    /// Per isolate: reference positions of its non-ancestral bases.
     pub(crate) positions: Vec<Vec<u32>>,
     /// Removed columns.
     pub(crate) removed: usize,
-    /// Removed columns in which the reference has a base and a position.
+    /// Removed columns placed on the reference (it has their variant group).
     pub(crate) mapped: usize,
 }
 
-/// The reference isolate and where its variant groups lie in its genome.
+/// Where the variant groups of the reference isolate lie in its genome.
 pub(crate) struct Reference<'a> {
-    /// Row of the reference in the alignment.
-    pub(crate) index: usize,
     /// Alignment column just after the last column of each variant group.
     pub(crate) group_ends: &'a [u32],
     /// Genome position of each variant group in the reference ([`NO_POSITION`] if
@@ -49,66 +51,105 @@ pub(crate) struct Reference<'a> {
     pub(crate) positions: &'a [u32],
 }
 
-#[inline]
-fn is_base(b: u8) -> bool {
-    matches!(b, b'A' | b'C' | b'G' | b'T')
+/// The removed columns that can be placed on the reference: their position and their
+/// base codes before masking (one per isolate), kept until the tree is built.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct RemovedSnps {
+    removed: usize,
+    placed: Vec<(u32, Vec<u8>)>,
 }
 
-/// Place the SNPs of the removed `columns` (ascending) on the reference genome.
-/// `rows` are the alignment rows after masking but before the columns are removed,
-/// and `original_bases` holds, per isolate, the masked columns (ascending) with their
-/// base before masking. An isolate is reported in a column when it was masked there
-/// and its base differs from the base of the reference (before masking).
-pub(crate) fn map_removed_snps(
-    rows: &[Vec<u8>],
-    columns: &[u32],
-    original_bases: &[Vec<(u32, u8)>],
-    reference: &Reference,
-) -> MappedSnps {
-    debug_assert!(columns.is_sorted());
-    // Position and base (before masking) of the reference in each removed column,
-    // when it has both.
-    let reference_masked = original_bases
-        .get(reference.index)
-        .map_or(&[][..], Vec::as_slice);
-    let placed: Vec<Option<(u32, u8)>> = columns
-        .iter()
-        .map(|&column| {
-            let group = reference.group_ends.partition_point(|&end| end <= column);
-            let position = reference
-                .positions
-                .get(group)
-                .copied()
-                .unwrap_or(NO_POSITION);
-            let base = match reference_masked.binary_search_by_key(&column, |&(c, _)| c) {
-                Ok(i) => reference_masked[i].1,
-                Err(_) => rows[reference.index][column as usize],
-            };
-            (position != NO_POSITION && is_base(base)).then_some((position, base))
-        })
-        .collect();
-    // Masked SNPs of the other isolates in the removed columns.
-    let mut positions = vec![Vec::new(); rows.len()];
-    for (isolate, masked) in original_bases.iter().enumerate() {
-        if isolate == reference.index {
-            continue;
-        }
-        for &(column, base) in masked {
-            let Ok(k) = columns.binary_search(&column) else {
-                continue;
-            };
-            if let Some((position, reference_base)) = placed[k] {
-                if is_base(base) && base != reference_base {
-                    positions[isolate].push(position);
+impl RemovedSnps {
+    /// `rows` are the alignment rows after masking, before the removed `columns`
+    /// (ascending) are taken out; `original_bases` holds, per isolate, the masked
+    /// columns (ascending) with their base before masking.
+    pub(crate) fn new(
+        rows: &[Vec<u8>],
+        columns: &[u32],
+        original_bases: &[Vec<(u32, u8)>],
+        reference: &Reference,
+    ) -> Self {
+        let mut placed: Vec<(u32, u32, Vec<u8>)> = columns
+            .iter()
+            .filter_map(|&column| {
+                let group = reference.group_ends.partition_point(|&end| end <= column);
+                let position = *reference.positions.get(group)?;
+                let bases = rows
+                    .iter()
+                    .map(|row| encode(row[column as usize]))
+                    .collect();
+                (position != NO_POSITION).then_some((column, position, bases))
+            })
+            .collect();
+        for (isolate, masked) in original_bases.iter().enumerate() {
+            let mut k = 0;
+            for &(column, base) in masked {
+                while k < placed.len() && placed[k].0 < column {
+                    k += 1;
+                }
+                if k < placed.len() && placed[k].0 == column {
+                    placed[k].2[isolate] = encode(base);
                 }
             }
         }
+        let placed = placed.into_iter().map(|(_, p, codes)| (p, codes)).collect();
+        Self {
+            removed: columns.len(),
+            placed,
+        }
     }
-    MappedSnps {
-        positions,
-        removed: columns.len(),
-        mapped: placed.iter().flatten().count(),
+
+    /// Report the non-ancestral bases on `tree`.
+    pub(crate) fn place(&self, tree: &Postorder) -> MappedSnps {
+        let n = self.placed.first().map_or(0, |(_, codes)| codes.len());
+        let mut positions = vec![Vec::new(); n];
+        let mut counts = vec![[0; 4]; tree.len()];
+        for (position, codes) in &self.placed {
+            let ancestral = ancestral_base(codes, tree, &mut counts);
+            for (isolate, &code) in codes.iter().enumerate() {
+                if code != INVALID && code != ancestral {
+                    positions[isolate].push(*position);
+                }
+            }
+        }
+        MappedSnps {
+            positions,
+            removed: self.removed,
+            mapped: self.placed.len(),
+        }
     }
+}
+
+/// Ancestral base of a column (base codes of the leaves of `tree`); `counts` (one per
+/// node) is scratch space.
+fn ancestral_base(codes: &[u8], tree: &Postorder, counts: &mut [[u8; 4]]) -> u8 {
+    counts.fill([0; 4]);
+    for &(node, parent) in tree {
+        // The bases of a node (bits) are those of the most children.
+        let set: u8 = match codes.get(node) {
+            Some(&code) if code < 4 => 1 << code,
+            Some(_) => 15,
+            None => {
+                let max = counts[node].iter().max().copied();
+                (0..4)
+                    .filter(|&b| Some(counts[node][b]) == max)
+                    .fold(0, |set, b| set | 1 << b)
+            }
+        };
+        let Some(parent) = parent else {
+            // The most frequent of the root's bases (the first one among equals).
+            let frequency = |b: u8| codes.iter().filter(|&&c| c == b).count();
+            return (0..4)
+                .filter(|&b| set >> b & 1 == 1)
+                .rev()
+                .max_by_key(|&b| frequency(b))
+                .unwrap();
+        };
+        for (b, count) in counts[parent].iter_mut().enumerate() {
+            *count += set >> b & 1;
+        }
+    }
+    unreachable!("a tree has a root")
 }
 
 /// SNPs of one isolate merged into one block (0-based positions, both included).
@@ -169,9 +210,9 @@ fn write_gff(
     writeln!(w, "##sequence-region SEQUENCE 1 {genome}")?;
     writeln!(
         w,
-        "# noref {}: SNPs of the alignment columns removed after recombination \
-         masking, on the genome of {} (contigs end to end), merged into blocks when \
-         less than {} bp apart",
+        "# noref {}: non-ancestral bases of the alignment columns removed after \
+         recombination masking, on the genome of {} (contigs end to end), merged into \
+         blocks when less than {} bp apart",
         env!("CARGO_PKG_VERSION"),
         names[reference],
         window
@@ -201,7 +242,7 @@ fn write_gff(
     Ok(stats)
 }
 
-/// Write the recombination plot of `mapped` (see [`map_removed_snps`]) to `path`.
+/// Write the recombination plot of `mapped` (see [`RemovedSnps::place`]) to `path`.
 /// `contig_ends` are those of the reference genome and `window` is in bases.
 pub(crate) fn write_plot(
     path: &Path,
@@ -226,38 +267,65 @@ mod tests {
     }
 
     #[test]
-    fn masked_isolates_with_another_base_than_the_reference_are_reported() {
-        // Isolate 0 is the reference; 3 variant groups: columns 0-1, 2, 3-4.
-        let rows = rows(&[b"ANNAC", b"GNNNT", b"NGCAN", b"-NN-T"]);
-        // Masked cells with their base before masking; other `N`s are missing data.
-        let original = vec![
-            vec![(1, b'C')],
-            vec![(3, b'G')],
-            vec![(0, b'A'), (4, b'T')],
-            vec![(1, b'C'), (2, b'C')],
-        ];
+    fn removed_columns_keep_their_bases_before_masking() {
+        // Columns 0-1, 2 and 3 are 3 variant groups; the reference lacks the second.
+        let rows = rows(&[b"NTCN", b"ANCA", b"G-CN"]);
+        let original = vec![vec![(0, b'C'), (3, b'G')], vec![(1, b'G')], vec![(3, b'T')]];
         let reference = Reference {
-            index: 0,
-            group_ends: &[2, 3, 5],
+            group_ends: &[2, 3, 4],
             positions: &[1_000, NO_POSITION, 50],
         };
-        let mapped = map_removed_snps(&rows, &[0, 1, 2, 3, 4], &original, &reference);
-        // Column 2 cannot be placed: the reference lacks its group (and has no base).
-        assert_eq!((mapped.removed, mapped.mapped), (5, 4));
-        // Isolate 1: masked G in column 3 (A in the reference); its G in column 0 and
-        // T in column 4 differ from the reference but were not masked.
-        // Isolate 2: masked with the reference's base in column 0, masked T in column 4
-        // (C in the reference).
-        // Isolate 3: masked with the reference's base in column 1 (where the reference
-        // was masked too), and in column 2, which cannot be placed.
-        assert_eq!(mapped.positions, vec![vec![], vec![50], vec![50], vec![]]);
-        // Masked SNPs of columns that are not removed are not reported.
-        let mapped = map_removed_snps(&rows, &[0, 1, 2], &original, &reference);
-        assert_eq!(mapped.mapped, 2);
-        assert!(mapped.positions.iter().all(Vec::is_empty));
-        // A column in which the reference has no base is not placed.
-        let mapped = map_removed_snps(&rows, &[1], &[], &reference);
-        assert_eq!((mapped.removed, mapped.mapped), (1, 0));
+        let removed = RemovedSnps::new(&rows, &[0, 1, 2, 3], &original, &reference);
+        let codes = |bases: &[u8]| bases.iter().map(|&b| encode(b)).collect::<Vec<_>>();
+        assert_eq!(removed.removed, 4);
+        assert_eq!(
+            removed.placed,
+            [
+                (1_000, codes(b"CAG")),
+                (1_000, codes(b"TG-")),
+                (50, codes(b"GAT"))
+            ]
+        );
+    }
+
+    #[test]
+    fn bases_that_differ_from_the_root_are_reported() {
+        // ((((3, 4), 2), 1), 0): internal nodes 5 to 7, root 8.
+        let tree = vec![
+            (0, Some(8)),
+            (1, Some(7)),
+            (2, Some(6)),
+            (3, Some(5)),
+            (4, Some(5)),
+            (5, Some(6)),
+            (6, Some(7)),
+            (7, Some(8)),
+            (8, None),
+        ];
+        // 10: the C of a clade, although more frequent than the ancestral A (also
+        // with a missing base, 20). 30: C or A at the root, A is more frequent. 40:
+        // any base at the root, T is the most frequent.
+        let columns = [
+            (10, b"AACCC"),
+            (20, b"AACC-"),
+            (30, b"CAAAA"),
+            (40, b"ACGTT"),
+        ];
+        let removed = RemovedSnps {
+            removed: 6,
+            placed: columns
+                .iter()
+                .map(|&(p, bases)| (p, bases.iter().map(|&b| encode(b)).collect()))
+                .collect(),
+        };
+        let expected = [
+            vec![30, 40],
+            vec![40],
+            vec![10, 20, 40],
+            vec![10, 20],
+            vec![10],
+        ];
+        assert_eq!(removed.place(&tree).positions, expected);
     }
 
     #[test]
