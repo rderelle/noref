@@ -64,7 +64,8 @@
 //!
 //! `-p`/`--plot <isolate>` additionally writes `noref_recombination.gff`, a
 //! recombination plot for [Phandango](https://github.com/jameshadfield/phandango) on
-//! the genome of that isolate (see [Recombination](#recombination)).
+//! the genome of that isolate (see [Recombination](#recombination)), and
+//! `noref_filtered_NJ.tree`, which the plot is based on (even without `--nj`).
 //!
 //! # Choosing parameters
 //!
@@ -102,13 +103,13 @@
 //! required by `-f`, or with a single base left, are removed from the alignment.
 //!
 //! With `--plot <isolate>`, these removed columns are placed on the genome of that
-//! isolate (the reference), at the position of their variant group; columns in which
-//! the reference has no base are left out. In each column, every other isolate in
-//! which the SNP was masked and whose base before masking differs from the
-//! reference's base is reported as carrying a recombinant SNP, and the SNPs of an
-//! isolate less than `-w` kb apart on the same reference contig are merged into one
-//! block. Blocks are written in the GFF format of Gubbins recombination predictions,
-//! which Phandango displays next to a tree.
+//! isolate (the reference), at the position of their variant group; columns whose
+//! group the reference lacks are left out. In each column, every isolate whose base
+//! before masking differs from the ancestral base (the most parsimonious one at the
+//! root of `noref_filtered_NJ.tree`) is reported as carrying a recombinant SNP, and
+//! the SNPs of an isolate less than `-w` kb apart on the same reference contig are
+//! merged into one block. Blocks are written in the GFF format of Gubbins
+//! recombination predictions, which Phandango displays next to a tree.
 use clap::Parser;
 
 mod dna;
@@ -226,7 +227,8 @@ pub struct Args {
     #[arg(long = "nj", help_heading = "Optional output")]
     pub nj: bool,
 
-    /// Write a gff recombination file for Phandango using this isolate genome as reference.
+    /// Write a gff recombination file for Phandango, with positions on this isolate's
+    /// genome, and the NJ tree of the filtered alignment.
     #[arg(
         short = 'p',
         long = "plot",
@@ -433,7 +435,8 @@ fn write_raw_outputs(
     );
     if args.nj {
         say!(log, "# build NJ tree of the raw alignment");
-        output::write_nj_tree(&paths.raw_tree, names, &alignment.concat, args.threads)?;
+        let tree = phylo::nj_tree_newick(names, &alignment.concat, args.threads)?;
+        output::write_nj_tree(&paths.raw_tree, &tree)?;
     }
     Ok(())
 }
@@ -447,7 +450,7 @@ fn mask_recombination(
     min_needed: usize,
     plot_reference: Option<usize>,
     log: &RunLog,
-) -> anyhow::Result<Option<(usize, plot::MappedSnps)>> {
+) -> anyhow::Result<Option<(usize, plot::RemovedSnps)>> {
     say!(log, "# cluster SNPs by isolate profile");
     let clusters = snp_clusters::cluster_snps(&alignment.concat, args.threads)?;
     let s = &clusters.stats;
@@ -478,18 +481,11 @@ fn mask_recombination(
     )?;
     say!(
         log,
-        " . masked SNPs: {} of {} isolate-SNP cells with data ({:.2}%)",
+        " . masked cells: {} of {} isolate-SNP cells with data ({:.2}%)",
         r.masked_cells,
         r.cells,
         100.0 * r.masked_cells as f64 / r.cells.max(1) as f64
     );
-    say!(
-        log,
-        " . SNP columns masked in at least one isolate: {} of {}",
-        r.masked_columns.len(),
-        clusters.stats.polymorphic
-    );
-    say!(log, " . isolates with masked SNPs: {}", r.isolates);
     drop(clusters);
 
     // Genome position of each variant group in the --plot reference.
@@ -509,13 +505,12 @@ fn mask_recombination(
     // The SNPs of the removed columns are placed on the reference before removal.
     let plot = plot_reference.map(|index| {
         let reference = plot::Reference {
-            index,
             group_ends: &alignment.group_ends,
             positions: &reference_positions,
         };
-        let mapped =
-            plot::map_removed_snps(&alignment.concat, &removed, &r.original_bases, &reference);
-        (index, mapped)
+        let snps =
+            plot::RemovedSnps::new(&alignment.concat, &removed, &r.original_bases, &reference);
+        (index, snps)
     });
     drop(r);
     recombination::remove_columns(&mut alignment.concat, &removed);
@@ -527,24 +522,27 @@ fn mask_recombination(
     Ok(plot)
 }
 
-/// Write the filtered alignment and its missing-data report, then the recombination
-/// plot (`--plot`) and the tree of the filtered alignment (`--nj`).
+/// Write the filtered alignment and its missing-data report, then the tree of the
+/// filtered alignment (`--nj` or `--plot`) and the recombination plot (`--plot`).
 fn write_filtered_outputs(
     args: &Args,
     paths: &OutputPaths,
     alignment: &AlignmentResult,
-    plot: Option<(usize, plot::MappedSnps)>,
+    plot: Option<(usize, plot::RemovedSnps)>,
     log: &RunLog,
 ) -> anyhow::Result<()> {
     let names = &alignment.isolate_names;
     output::write_alignment(&paths.filtered_alignment, names, &alignment.concat)?;
     output::write_missing(&paths.filtered_missing, names, &alignment.concat)?;
-    if let Some((reference, mapped)) = plot {
-        write_recombination_plot(args, paths, alignment, reference, mapped, log)?;
+    if !args.nj && plot.is_none() {
+        return Ok(());
     }
-    if args.nj {
-        say!(log, "# build NJ tree of the filtered alignment");
-        output::write_nj_tree(&paths.filtered_tree, names, &alignment.concat, args.threads)?;
+    say!(log, "# build NJ tree of the filtered alignment");
+    let (newick, tree) = phylo::nj_tree(names, &alignment.concat, args.threads)?;
+    output::write_nj_tree(&paths.filtered_tree, &newick)?;
+    if let Some((reference, snps)) = plot {
+        let mapped = snps.place(&tree);
+        write_recombination_plot(args, paths, alignment, reference, mapped, log)?;
     }
     Ok(())
 }
@@ -561,7 +559,7 @@ fn write_recombination_plot(
     say!(log, "# generate recombination file");
     say!(
         log,
-        " . removed SNPs placed on {} (--plot): {} of {}",
+        " . masked SNPs placed on {}: {} of {}",
         names[reference],
         mapped.mapped,
         mapped.removed
