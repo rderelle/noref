@@ -115,15 +115,8 @@ pub fn write_missing(path: &Path, names: &[String], rows: &[Vec<u8>]) -> Result<
     Ok(())
 }
 
-/// Build a neighbor-joining tree of an alignment and write it in Newick format. Trees
-/// are optional because they add an O(n²·L) distance pass.
-pub fn write_nj_tree(
-    path: &Path,
-    names: &[String],
-    rows: &[Vec<u8>],
-    threads: usize,
-) -> Result<()> {
-    let tree = crate::phylo::nj_tree_newick(names, rows, threads)?;
+/// Write a tree in Newick format (see [`crate::phylo`]).
+pub fn write_nj_tree(path: &Path, tree: &str) -> Result<()> {
     let mut tw = BufWriter::new(File::create(path)?);
     writeln!(tw, "{}", tree)?;
     tw.flush()?;
