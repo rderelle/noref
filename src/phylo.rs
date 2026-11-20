@@ -1,7 +1,8 @@
-//! Minimal neighbor-joining implementation used for the optional `--nj` tree.
+//! Minimal neighbor-joining implementation used for the optional `--nj` tree, and for
+//! the ancestral bases of the recombination plot (`--plot`, see [`crate::plot`]).
 //!
-//! The unrooted NJ tree is written rooted at its midpoint: halfway along the longest
-//! path between two leaves.
+//! The unrooted NJ tree is rooted at its midpoint: halfway along the longest path
+//! between two leaves.
 //!
 //! Distances are JC69-corrected pairwise nucleotide differences, ignoring gaps
 //! and `N`. The alignment is bit-sliced so each pair comparison handles
@@ -477,12 +478,42 @@ fn validate_alignment(names: &[String], seqs: &[Vec<u8>]) -> anyhow::Result<usiz
     Ok(len)
 }
 
-/// Midpoint-rooted neighbor-joining tree of an alignment, in Newick format.
-pub fn nj_tree_newick(
+/// Nodes of a tree rooted at its midpoint, each with its parent: children before
+/// parents, and the root (without parent) last. Leaves are `0..n`; a root on a branch
+/// is an extra node, numbered after the others.
+pub(crate) type Postorder = Vec<(usize, Option<usize>)>;
+
+fn postorder(adjacency: &[Vec<(usize, f64)>], n: usize) -> Postorder {
+    let mut order = Vec::with_capacity(adjacency.len() + 1);
+    // Depth-first from the root, as `(node, neighbour towards the root, parent)`:
+    // parents come before children, until the order is reversed.
+    let mut stack = match midpoint_root(adjacency, n) {
+        Root::Node(root) => vec![(root, usize::MAX, None)],
+        Root::Branch([(a, _), (b, _)]) => {
+            let root = adjacency.len();
+            order.push((root, None));
+            vec![(a, b, Some(root)), (b, a, Some(root))]
+        }
+    };
+    while let Some((node, from, parent)) = stack.pop() {
+        order.push((node, parent));
+        for &(next, _) in &adjacency[node] {
+            if next != from {
+                stack.push((next, node, Some(node)));
+            }
+        }
+    }
+    order.reverse();
+    order
+}
+
+/// Midpoint-rooted neighbor-joining tree of an alignment, in Newick format and as
+/// its [`Postorder`].
+pub(crate) fn nj_tree(
     names: &[String],
     seqs: &[Vec<u8>],
     num_threads: usize,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, Postorder)> {
     let len = validate_alignment(names, seqs)?;
     let pool = ThreadPoolBuilder::new()
         .num_threads(num_threads.max(1))
@@ -491,7 +522,20 @@ pub fn nj_tree_newick(
     let mut nj = Nj::new(names.len());
     nj.load(names.len(), &compute_distance_matrix(&alignment, &pool));
     nj.reduce(names.len());
-    Ok(midpoint_newick(names, &unrooted_tree(names.len(), &nj)))
+    let adjacency = unrooted_tree(names.len(), &nj);
+    Ok((
+        midpoint_newick(names, &adjacency),
+        postorder(&adjacency, names.len()),
+    ))
+}
+
+/// Midpoint-rooted neighbor-joining tree of an alignment, in Newick format.
+pub fn nj_tree_newick(
+    names: &[String],
+    seqs: &[Vec<u8>],
+    num_threads: usize,
+) -> anyhow::Result<String> {
+    Ok(nj_tree(names, seqs, num_threads)?.0)
 }
 
 #[cfg(test)]
@@ -575,6 +619,31 @@ mod tests {
         assert_eq!(
             midpoint_newick(&names(&["A", "B", "C"]), &adjacency),
             "(A:1.000000,B:1.000000,C:0.500000);"
+        );
+    }
+
+    #[test]
+    fn postorder_ends_at_the_midpoint_root() {
+        // Root on the branch from D (node 3) to node 5 (see above): extra node 6.
+        let branches = [
+            (4, 0, 1.0),
+            (4, 1, 1.0),
+            (5, 2, 1.0),
+            (5, 3, 5.0),
+            (4, 5, 1.0),
+        ];
+        let order = postorder(&tree(6, &branches), 4);
+        let rank = |node| order.iter().position(|&(n, _)| n == node).unwrap();
+        assert!(order
+            .iter()
+            .all(|&(n, up)| up.is_none_or(|up| rank(up) > rank(n))));
+        let mut parent = vec![None; order.len()];
+        for &(node, up) in &order {
+            parent[node] = up;
+        }
+        assert_eq!(
+            parent,
+            [Some(4), Some(4), Some(5), Some(6), Some(5), Some(6), None]
         );
     }
 
