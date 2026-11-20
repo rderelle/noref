@@ -153,6 +153,27 @@ fn skipping_recombination_stops_at_the_raw_alignment() {
 }
 
 #[test]
+fn plot_writes_the_tree_it_is_based_on() {
+    let out = tempfile::tempdir().unwrap();
+    let mut a = args(
+        Some(canonical(INPUT_DIR)),
+        None,
+        out.path().join("noref"),
+        2,
+    );
+    a.nj = false;
+    a.plot = Some("G7".to_string());
+    run_with_args(a).unwrap();
+    // The tree of the filtered alignment, as with --nj, but not that of the raw one.
+    let tree = "noref_filtered_NJ.tree";
+    assert_eq!(
+        fs::read_to_string(Path::new(EXPECTED).join(tree)).unwrap(),
+        fs::read_to_string(out.path().join(tree)).unwrap()
+    );
+    assert!(!out.path().join("noref_raw_NJ.tree").exists());
+}
+
+#[test]
 fn plot_reference_must_be_an_input_isolate() {
     let out = tempfile::tempdir().unwrap();
     let mut a = args(
