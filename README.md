@@ -10,7 +10,7 @@
 
 noref ('no reference' genome needed) is designed for within-species phylogenetic analyses (population genomics) from genome assemblies, in a fast and easy way. It is only recommended for bacterial species and only accepts genome assemblies as input (not sequencing reads).
 
-It was developed to perform both steps, SNP calling and detection of recombination tracts, in a reference-free manner (see also the 'distance' command of [Verticall](https://github.com/rrwick/Verticall)). This reduces biases and greatly simplifies phylogenetic workflows: there is no need to choose a suitable reference, and both steps are handled by a single tool.
+It was developed to perform both steps, SNP calling and detection of recombination tracts, in a reference-free manner (see also the 'distance' command of [Verticall](https://github.com/rrwick/Verticall)). This greatly simplifies phylogenetic workflows: there is no need to choose a suitable reference, and both steps are handled by a single tool.
 
 > [!NOTE]
 > Please note that this tool is still under development.
@@ -69,10 +69,6 @@ For the latter, the name of the input isolate whose genome the recombinant SNPs 
 
 Unlike ClonalFrameML and Gubbins, noref operates in reference-free mode and makes no attempt at determining when and where a recombination occurred. So the Phandango plot suffers from 2 caveats: (i) not all masked SNPs will be represented using the chosen genome and (ii) the polarisation of recombination events is approximate (done here by parsimony on the midpoint-rooted NJ tree).
 
-> [!TIP]
-> IMHO, whether to include recombinant SNPs in phylogenetic analyses depends on the question being asked:
-> - *How different or similar are the isolates to each other?* -> all SNPs
-> - *How related are the isolates to each other* -> non-recombinant SNPs (filtered SNPs)
 
 ---
 This codebase is provided under the MIT License. The code was drafted using AI assistance.
