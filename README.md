@@ -10,9 +10,7 @@
 
 noref ('no reference' genome needed) is designed for within-species phylogenetic analyses (population genomics) from genome assemblies, in a fast and easy way. It is only recommended for bacterial species and only accepts genome assemblies as input (not sequencing reads).
 
-In most bacterial phylogenomic workflows, SNP calling and recombination detection are separate steps. SNPs are often mapped onto a reference genome, and recombination tracts are then identified and removed using tools such as [ClonalFrameML](https://github.com/xavierdidelot/ClonalFrameML), [Gubbins](https://github.com/nickjcroucher/gubbins) or [Verticall](https://github.com/rrwick/Verticall).
-noref was developed to perform both steps, SNP calling and detection of recombination tracts, in a reference-free manner.
-This reduces biases and greatly simplifies phylogenetic workflows: there is no need to choose a suitable reference, and both steps are handled by a single tool.
+It was developed to perform both steps, SNP calling and detection of recombination tracts, in a reference-free manner (see also the 'distance' command of [Verticall](https://github.com/rrwick/Verticall)). This reduces biases and greatly simplifies phylogenetic workflows: there is no need to choose a suitable reference, and both steps are handled by a single tool.
 
 > [!NOTE]
 > Please note that this tool is still under development.
