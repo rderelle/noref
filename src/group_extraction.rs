@@ -1,10 +1,11 @@
 //! Raw variant group extraction from genome assemblies.
 //!
-//! Pass 1 counts, for every canonical `k`-mer, the number of genomes containing it.
-//! Pass 2 rescans each contig, finds shared `k`-mer anchors bracketing local drops in
-//! occupancy, and stores the bases between adjacent anchors. These occurrences are
-//! merged, genome by genome, into variant groups (one per anchor pair) by the thread
-//! that extracted them, in [`SHARDS`] independent tables.
+//! Pass 1 counts, for every canonical `k`-mer found in enough genomes, the exact number
+//! of genomes containing it (see [`crate::kmer_counts`]). Pass 2 rescans each contig,
+//! finds shared `k`-mer anchors bracketing local drops in occupancy, and stores the
+//! bases between adjacent anchors. These occurrences are merged, genome by genome, into
+//! variant groups (one per anchor pair) by the thread that extracted them, in
+//! [`SHARDS`] independent tables.
 //!
 //! Contig orientation in an assembly is arbitrary, so anchor pairs are detected on both
 //! strands and stored in a canonical orientation: the same locus therefore yields the
@@ -28,7 +29,7 @@ use std::sync::Mutex;
 
 use crate::dna::{encode, normalize, revcomp_code, Roller, INVALID};
 use crate::io::{open_fasta, IsolateInput};
-use crate::proba_filter::{BloomFilter, CountMinSketch, BATCH, BLOOM_BITS, CMS_LINES};
+use crate::kmer_counts::{kmer_hash, KmerBuckets, KmerCounter, KmerCounts, BATCH};
 use crate::run_log::{say, RunLog};
 
 const START_CLUSTER_SPAN: u32 = 10;
@@ -320,7 +321,7 @@ struct LocalOccurrence {
 struct KmerHit {
     /// Position of the first base of the k-mer in the segment.
     start: u32,
-    /// Estimated number of genomes containing the k-mer.
+    /// Number of genomes containing the k-mer.
     occupancy: u16,
 }
 
@@ -390,8 +391,8 @@ fn pair_anchors(
 /// Reusable per-thread buffers for segment scanning.
 #[derive(Default)]
 struct Scratch {
-    /// Canonical k-mers of the current batch and their occupancies.
-    keys: Vec<u64>,
+    /// Hashes of the canonical k-mers of the current batch, and their occupancies.
+    hashes: Vec<u64>,
     occupancies: Vec<u16>,
     starts: Vec<KmerHit>,
     ends: Vec<KmerHit>,
@@ -403,7 +404,7 @@ struct Scratch {
 
 struct SegmentContext<'a> {
     k: usize,
-    cms: &'a CountMinSketch,
+    counts: &'a KmerCounts,
     min_needed: u32,
     length_middle: usize,
 }
@@ -426,13 +427,13 @@ fn find_segment_anchor_pairs(seg: &[u8], ctx: &SegmentContext, s: &mut Scratch) 
     }
     let mut previous: Option<KmerHit> = None;
     for (batch, chunk) in seg[k - 1..].chunks(BATCH).enumerate() {
-        s.keys.clear();
-        s.keys.extend(chunk.iter().map(|&b| {
+        s.hashes.clear();
+        s.hashes.extend(chunk.iter().map(|&b| {
             roller.push(encode(b));
-            roller.canonical()
+            kmer_hash(roller.canonical())
         }));
         s.occupancies.resize(chunk.len(), 0);
-        ctx.cms.estimate_batch(&s.keys, &mut s.occupancies);
+        ctx.counts.occupancy_batch(&s.hashes, &mut s.occupancies);
         for (i, &occupancy) in s.occupancies.iter().enumerate() {
             let hit = KmerHit {
                 start: (batch * BATCH + i) as u32,
@@ -628,18 +629,10 @@ impl Merger {
     }
 }
 
-/// Pass 1: report the distinct canonical k-mers of a genome, in batches of up to
-/// [`BATCH`] keys.
-fn count_isolate_kmers(
-    input: &IsolateInput,
-    k: usize,
-    mut flush: impl FnMut(&[u64]),
-) -> Result<()> {
+/// Pass 1: report every canonical k-mer of a genome (duplicates included).
+fn count_isolate_kmers(input: &IsolateInput, k: usize, mut add: impl FnMut(u64)) -> Result<()> {
     let mut reader = FastaReader::new(open_fasta(&input.path)?);
-    let mut bloom = BloomFilter::new(BLOOM_BITS);
     let mut roller = Roller::new(k);
-    // Canonical k-mers in genome order, then only those seen for the first time.
-    let mut keys = Vec::with_capacity(BATCH);
     while let Some(rec) = reader.next() {
         let rec = rec?;
         roller.reset();
@@ -651,19 +644,12 @@ fn count_isolate_kmers(
                 INVALID => roller.reset(),
                 code => {
                     if roller.push(code) {
-                        keys.push(roller.canonical());
-                        if keys.len() == BATCH {
-                            bloom.retain_unseen(&mut keys);
-                            flush(&keys);
-                            keys.clear();
-                        }
+                        add(roller.canonical());
                     }
                 }
             }
         }
     }
-    bloom.retain_unseen(&mut keys);
-    flush(&keys);
     Ok(())
 }
 
@@ -744,31 +730,34 @@ pub(crate) fn extract_groups(
     let n_threads = num_threads.max(1);
     let pool = ThreadPoolBuilder::new().num_threads(n_threads).build()?;
 
-    // Pass 1: count genome occupancies. Threads add k-mers to the sketch region by
-    // region (see `SharedSketch`), so the counts do not depend on the number of threads.
-    say!(log, " . pass 1: estimate k-mer occupancies");
+    // Pass 1: count genome occupancies. Each thread collects the k-mers of a genome,
+    // then adds them to the count tables one table at a time; the counts are exact, so
+    // they do not depend on the number of threads.
+    say!(log, " . pass 1: count k-mer occupancies");
     let progress = Progress::new(n);
-    let mut cms = CountMinSketch::new(CMS_LINES);
-    let shared = cms.shared();
+    let counter = KmerCounter::new(n, min_needed as usize);
     let result = pool.install(|| {
-        inputs.par_iter().try_for_each(|input| {
-            let mut writer = shared.writer();
-            count_isolate_kmers(input, k, |keys| writer.add(keys))?;
-            writer.finish();
-            progress.increment();
-            Ok::<_, anyhow::Error>(())
-        })
+        inputs.par_iter().enumerate().try_for_each_init(
+            KmerBuckets::new,
+            |kmers, (isolate, input)| {
+                kmers.clear();
+                count_isolate_kmers(input, k, |key| kmers.push(key))?;
+                counter.add_genome(isolate as u16, kmers);
+                progress.increment();
+                Ok::<_, anyhow::Error>(())
+            },
+        )
     });
-    drop(shared);
     progress.finish();
     result?;
+    let counts = counter.finish();
 
     // Pass 2: each thread extracts the occurrences of a genome, then merges them into
     // the group tables, one table at a time.
     say!(log, " . pass 2: extract sequences");
     let ctx = SegmentContext {
         k,
-        cms: &cms,
+        counts: &counts,
         min_needed,
         length_middle,
     };
@@ -796,7 +785,7 @@ pub(crate) fn extract_groups(
     });
     progress.finish();
     let contig_ends = contig_ends?;
-    drop(cms);
+    drop(counts);
 
     // Gather the groups of all tables, and their sequences in one arena.
     let mut arena = BlockArena::new();
@@ -928,23 +917,70 @@ mod tests {
         mirror_roundtrip(9, 5);
     }
 
-    /// CMS where every k-mer of `shared` sequences reaches `n` and others stay at 0.
-    fn sketch(shared: &[&[u8]], k: usize, n: u32) -> CountMinSketch {
-        let mut cms = CountMinSketch::new(1 << 12);
-        let mut keys = hashbrown::HashSet::new();
-        for seq in shared {
-            let mut roller = Roller::new(k);
-            for &b in *seq {
-                if roller.push(encode(b)) {
-                    keys.insert(roller.canonical());
-                }
+    /// Canonical k-mers of a sequence.
+    fn kmers(seq: &[u8], k: usize) -> Vec<u64> {
+        let mut roller = Roller::new(k);
+        let mut keys = Vec::new();
+        for &b in seq {
+            if roller.push(encode(b)) {
+                keys.push(roller.canonical());
             }
         }
-        let keys: Vec<u64> = keys.into_iter().collect();
-        for _ in 0..n {
-            cms.increment_batch(&keys);
+        keys
+    }
+
+    /// Counts where every k-mer of `shared` sequences is in `n` genomes and others in none.
+    fn shared_counts(shared: &[&[u8]], k: usize, n: usize) -> KmerCounts {
+        let genome: Vec<u64> = shared.iter().flat_map(|seq| kmers(seq, k)).collect();
+        KmerCounts::from_genomes(&vec![genome; n], n)
+    }
+
+    #[test]
+    fn counts_below_the_threshold_do_not_change_anchors() {
+        // 8 genomes sharing a sequence, with SNPs carried by 0 to 8 of them: k-mers
+        // overlapping a SNP are found in fewer genomes, below or above the threshold.
+        let (k, min_needed) = (9, 5);
+        let mut state = 1u64;
+        let mut base = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            b"ACGT"[(state >> 62) as usize]
+        };
+        let shared: Vec<u8> = (0..600).map(|_| base()).collect();
+        let genomes: Vec<Vec<u8>> = (0..8)
+            .map(|g| {
+                let mut seq = shared.clone();
+                for site in (20..580).step_by(23) {
+                    if g < site % 9 {
+                        seq[site] = b"ACGT"[(encode(seq[site]) as usize + 1) % 4];
+                    }
+                }
+                seq
+            })
+            .collect();
+        let kmer_lists: Vec<Vec<u64>> = genomes.iter().map(|g| kmers(g, k)).collect();
+        // All counts, or only those reaching the threshold (as in a run).
+        let all = KmerCounts::from_genomes(&kmer_lists, 1);
+        let thresholded = KmerCounts::from_genomes(&kmer_lists, min_needed);
+        let pairs = |counts: &KmerCounts, seq: &[u8]| {
+            let ctx = SegmentContext {
+                k,
+                counts,
+                min_needed: min_needed as u32,
+                length_middle: 40,
+            };
+            let mut scratch = Scratch::default();
+            find_segment_anchor_pairs(seq, &ctx, &mut scratch);
+            scratch.pairs
+        };
+        let mut found = 0;
+        for genome in &genomes {
+            let expected = pairs(&all, genome);
+            found += expected.len();
+            assert_eq!(pairs(&thresholded, genome), expected);
         }
-        cms
+        assert!(found > 50, "{found}");
     }
 
     fn extract(seg: &[u8], ctx: &SegmentContext) -> (Vec<LocalOccurrence>, BlockArena) {
@@ -971,10 +1007,10 @@ mod tests {
         let reference = [LEFT, b"C", RIGHT].concat();
         let variant = [LEFT, b"T", RIGHT].concat();
         // Only the reference k-mers are shared, so the SNP region forms one occurrence.
-        let cms = sketch(&[&reference], k, 2);
+        let counts = shared_counts(&[&reference], k, 2);
         let ctx = SegmentContext {
             k,
-            cms: &cms,
+            counts: &counts,
             min_needed: 2,
             length_middle: 20,
         };
@@ -1077,10 +1113,10 @@ mod tests {
         let k = 7;
         let reference = [LEFT, b"C", RIGHT].concat();
         let variant = [LEFT, b"T", RIGHT].concat();
-        let cms = sketch(&[&reference], k, 2);
+        let counts = shared_counts(&[&reference], k, 2);
         let ctx = SegmentContext {
             k,
-            cms: &cms,
+            counts: &counts,
             min_needed: 2,
             length_middle: 20,
         };
@@ -1140,15 +1176,15 @@ mod tests {
                 path: path.clone(),
             };
             let mut kmers = Vec::new();
-            count_isolate_kmers(&input, 5, |keys| kmers.extend_from_slice(keys)).unwrap();
+            count_isolate_kmers(&input, 5, |key| kmers.push(key)).unwrap();
             kmers.sort_unstable();
             kmers
         };
         let fwd = count(&[b">c1\n".as_slice(), seq, b"\n"].concat());
         let rev = count(&[b">c1\n".as_slice(), &rc, b"\n"].concat());
         assert_eq!(fwd, rev);
-        // 20 + 12 valid bases on either side of R: 16 + 8 windows (some may repeat).
-        assert!(fwd.len() <= 24 && fwd.len() >= 20);
+        // 21 + 12 valid bases on either side of R: 17 + 8 windows.
+        assert_eq!(fwd.len(), 25);
         let wrapped = count(b">c1\nACGTTGCAAG\nGCTTACGATCG\r\nRTCGGATCCATGC\n");
         assert_eq!(wrapped, fwd);
     }
