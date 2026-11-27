@@ -212,7 +212,7 @@ fn the_run_is_logged() {
     assert!(lines[1].starts_with("noref "), "{log}");
     assert!(lines[2].starts_with("parameters: ") && lines[2].contains("plot=G7"));
     for section in [
-        " . pass 1: estimate k-mer occupancies",
+        " . pass 1: count k-mer occupancies",
         " . pass 2: extract sequences",
         "# analyse variant groups",
         "# build NJ tree of the raw alignment",
