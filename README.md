@@ -8,7 +8,7 @@
 </p>
 
 
-noref ('no reference' genome needed) is designed for within-species phylogenetic analyses (population genomics) from genome assemblies, in a fast and easy way. It is only recommended for bacterial species and only accepts genome assemblies as input (not sequencing reads).
+noref ('no reference' genome needed) is designed for within-species phylogenetic analyses (population genomics) from genome assemblies, in a fast and easy way. It ~~is only recommended for bacterial species and~~ only accepts genome assemblies as input (not sequencing reads).
 
 It was developed to perform both steps, SNP calling and detection of recombination tracts, in a reference-free manner (see also the 'distance' command of [Verticall](https://github.com/rrwick/Verticall)). This greatly simplifies phylogenetic workflows: there is no need to choose a suitable reference, and both steps are handled by a single tool.
 
